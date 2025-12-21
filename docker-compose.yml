@@ -1,0 +1,19 @@
+services:
+  backend:
+    build:
+      context: ./src
+    container_name: nika
+    ports:
+      - "6006:6006"
+    volumes:
+      - ./src:/app
+      - ./static:/app/static
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
