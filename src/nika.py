@@ -5,12 +5,10 @@ import glob
 from functools import partial
 
 import torch
-from torch.utils.checkpoint import checkpoint
 from torch.profiler import profile, record_function, ProfilerActivity
 import torch.nn as nn
 from torchvision.utils import save_image
 import torch.nn.functional as F
-from torch.optim import AdamW
 
 import numpy as np
 import imageio.v3 as iio
@@ -745,6 +743,7 @@ def feature_test(vid, device):
             for t in torch.linspace(0.0, 1.0, steps=10):
                 with torch.no_grad():
                     test_img = model(t.item())
+                    os.makedirs("out_feature_test", exist_ok=True)
                     save_image(test_img, f"out_feature_test/test_image_epoch{epoch}_t{t.item():.2f}.png")
             # model.test_images("out_feature_test")
 
