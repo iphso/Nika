@@ -516,15 +516,36 @@ def explain(vid, device):
         prediction = model(t_batch)
         pixel_sum = prediction.sum()
         upres_input_grad = grad(pixel_sum, model.upres.inputs)[0]
+        contributions = upres_input_grad.abs().mean(dim=(2, 3))
+        print(contributions)
+        absed = []
         for i in range(9):
             save_image(rescale(upres_input_grad[0,i,...]), f"visuals/frame0_channel{i}.png")
-            save_image(rescale(upres_input_grad[0,i,...].abs()), f"visuals/frame0_channel{i}_abs.png")
+            abs_i = rescale(upres_input_grad[0,i,...]).abs()
+            save_image(abs_i, f"visuals/frame0_channel{i}_abs.png")
+            absed.append(abs_i)
+
+        intensities = []
+        for start in range(0, 9, 3):
+            combined = torch.stack(absed[start:start+3], axis=0)
+            intensity = combined.norm(dim=0)
+            intensities.append(intensity)
+            intensity = intensity / intensity.max()
+            names = {
+                0: 'real',
+                3: 'imaginary',
+                6: 'feature_grid'
+            }
+            save_image(combined, f"visuals/{names[start]}_independent_norm.png")
+            save_image(intensity, f"visuals/{names[start]}_intensity.png")
+
+        save_image(rescale(torch.stack(intensities, axis=0)), "visuals/merge_all_the_things.png")
         save_image(rescale(upres_input_grad[0,:3,...]), "visuals/real_branch_frame0.png")
         save_image(rescale(upres_input_grad[0,3:6,...]), "visuals/imaginary_branch_frame0.png")
         save_image(rescale(upres_input_grad[0,6:,...]), "visuals/feature_grid_branch_frame0.png")
-        save_image(rescale(upres_input_grad[0,:3,...].abs()), "visuals/real_branch_abs_frame0.png")
-        save_image(rescale(upres_input_grad[0,3:6,...].abs()), "visuals/imaginary_branch_abs_frame0.png")
-        save_image(rescale(upres_input_grad[0,6:,...].abs()), "visuals/feature_grid_branch_abs_frame0.png")
+        save_image(rescale(upres_input_grad[0,:3,...]).abs(), "visuals/real_branch_abs_frame0.png")
+        save_image(rescale(upres_input_grad[0,3:6,...]).abs(), "visuals/imaginary_branch_abs_frame0.png")
+        save_image(rescale(upres_input_grad[0,6:,...]).abs(), "visuals/feature_grid_branch_abs_frame0.png")
         import pdb; pdb.set_trace()
 
 
