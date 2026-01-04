@@ -11,6 +11,7 @@ from configs import REFERENCES
 
 def get_best_model(model_dir, vid_shape, vid_name, config):
     all_models = glob.glob(f"{model_dir}/{config}-{vid_name}-*.torch")
+    print(all_models)
     if not all_models:
         raise ValueError(f"No models found for {vid_name} with config {config}")
 
@@ -22,7 +23,7 @@ def get_best_model(model_dir, vid_shape, vid_name, config):
         raise ValueError(f"Could not extract PSNR from filename: {filename}")
     all_models.sort(key=extract_psnr)
 
-    print(f"Best model for {vid_name} with config {config}: {all_models[-2]}")
+    print(f"Best model for {vid_name} with config {config}: {all_models[-1]}")
     model = NikaBlock(
         target_shape=[4, vid_shape[2], vid_shape[3], vid_shape[0]],
         k=4,
@@ -30,7 +31,7 @@ def get_best_model(model_dir, vid_shape, vid_name, config):
         out_channels=3,
         device=device,
     )
-    state_dict = torch.load(all_models[-2])
+    state_dict = torch.load(all_models[-1])
     model.load_state_dict(state_dict)
     return model
 
@@ -141,4 +142,4 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    benchmark_psnr("static/benchmarks", "bunny", "xs", device)
+    benchmark_psnr("static/benchmarks", "beauty", "small", device)
