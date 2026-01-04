@@ -2,29 +2,46 @@ import torch
 import torch.nn.functional as F
 from torchvision.utils import save_image
 
+import re
+import glob
 from load_data import load_video_frames
 from nika import NikaBlock
 from soap import SOAP
 from configs import REFERENCES
 
-def benchmark_psnr(name, config, device):
-    vid = load_video_frames(f"static/benchmarks/bunny", device, max_frames=600, dtype=torch.uint8, normalize=False)
+def get_best_model(model_dir, vid_shape, vid_name, config):
+    all_models = glob.glob(f"{model_dir}/{config}-{vid_name}-*.torch")
+    if not all_models:
+        raise ValueError(f"No models found for {vid_name} with config {config}")
+
+    # Sort models by PSNR (extracting the PSNR value from the filename)
+    def extract_psnr(filename):
+        match = re.search(r'psnr([0-9]+(?:\.[0-9]+)?)', filename)
+        if match:
+            return float(match.group(1))
+        raise ValueError(f"Could not extract PSNR from filename: {filename}")
+    all_models.sort(key=extract_psnr)
+
+    print(f"Best model for {vid_name} with config {config}: {all_models[-2]}")
     model = NikaBlock(
-        target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
+        target_shape=[4, vid_shape[2], vid_shape[3], vid_shape[0]],
         k=4,
         **REFERENCES[config],
         out_channels=3,
         device=device,
     )
-    state_dict = torch.load("models/xxs-bunny-epoch1934-psnr31.05.torch")
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"Model loaded. Missing keys: {missing}, Unexpected keys: {unexpected}")
-    print(f"Model parameter count: {sum(p.numel() for p in model.parameters())}")
+    state_dict = torch.load(all_models[-2])
+    model.load_state_dict(state_dict)
+    return model
+
+def benchmark_psnr(basedir, vid_name, config, device):
+    vid = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    model = get_best_model("models", vid.shape, vid_name, config)
     model.eval()
     total_psnr = 0.0
     num_frames = vid.shape[0]
 
-    batch_size = 10  # You can adjust this as needed
+    batch_size = 10
     num_batches = (num_frames + batch_size - 1) // batch_size
     with torch.no_grad():
         for batch_idx in range(num_batches):
@@ -34,7 +51,7 @@ def benchmark_psnr(name, config, device):
             t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
             prediction = model(t_batch)
             for i in range(prediction.shape[0]):
-                save_image(prediction[i], f"visuals/{name}_frame{min_t + i:03d}.png")
+                save_image(prediction[i], f"visuals/{vid_name}_frame{min_t + i:03d}.png")
                 mse = F.mse_loss(prediction[i].clamp(0, 1), batch_gt[i])
                 psnr = 10 * torch.log10(1 / (mse + 1e-8))
                 total_psnr += psnr.item()
@@ -124,4 +141,4 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    benchmark_psnr("beauty", "xxs", device)
+    benchmark_psnr("static/benchmarks", "bunny", "xs", device)

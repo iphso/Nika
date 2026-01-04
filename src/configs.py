@@ -20,13 +20,13 @@ REFERENCES = {
     "medium": {
         "grid_ranks": [6, 40, 50, 70],
         "real_tucker_ranks": [6, 80, 80, 70],
-        "complex_tucker_ranks": [6, 60, 70, 60],
+        "complex_tucker_ranks": [6, 60, 60, 50],
         "conv_hidden": 84,
     },
     "large": {
         "grid_ranks": [12, 40, 50, 70],
         "real_tucker_ranks": [12, 80, 80, 70],
-        "complex_tucker_ranks": [12, 60, 70, 60],
+        "complex_tucker_ranks": [12, 60, 60, 50],
         "conv_hidden": 84,
     }
 }
