@@ -235,29 +235,54 @@ def tucker_construct(UT, UC, UH, UW, G):
             norms = M.norm(dim=0, keepdim=True) + eps
         return M / norms
 
-    rH, rW, rC, rT = G.shape
-    T, C, H, W = UT.shape[0], UC.shape[0], UH.shape[0], UW.shape[0]
-
-    assert UT.shape[1] == rT and UC.shape[1] == rC and UH.shape[1] == rH and UW.shape[1] == rW
-
     UH = _col_norm(UH)
     UW = _col_norm(UW)
     UC = _col_norm(UC)
     UT = _col_norm(UT)
 
-    G_flat  = G.view(-1, rT)
-    Gt_flat = (G_flat @ UT.T)
-    Gt      = Gt_flat.view(rH, rW, rC, T).permute(0, 1, 3, 2)
+    X = torch.einsum('ijkl,tl,ck,hi,wj->tchw', G, UT, UC, UH, UW)
+    return X
 
-    temp = (Gt @ UC.T).permute(2, 3, 1, 0)  # [T, C, rW, rH]
-    temp = (temp @ UH.T).permute(0, 1, 3, 2)  # [T, C, H, rW]
-    X = (temp @ UW.T).contiguous()  # [T, C, H, W]
-    X = X.permute(1, 0, 2, 3).reshape(T, C, H, W)  # [T, C, H, W]
+
+def cp_construct(UT, UC, UH, UW):
+    UT = UT.contiguous()
+    UC = UC.contiguous()
+    UH = UH.contiguous()
+    UW = UW.contiguous()
+
+    r = UT.shape[1]
+    T, C, H, W = UT.shape[0], UC.shape[0], UH.shape[0], UW.shape[0]
+
+    assert UC.shape[1] == r and UH.shape[1] == r and UW.shape[1] == r
+
+    X = torch.zeros((T, C, H, W), device=UT.device, dtype=UT.dtype)
+
+    for i in range(r):
+        outer_product = torch.einsum('t,c,h,w->tc hw', UT[:, i], UC[:, i], UH[:, i], UW[:, i])
+        X += outer_product.reshape(T, C, H, W)
 
     return X
 
+class FactorizedCore(nn.Module):
+    def __init__(self, target_shape, rank, device='cuda'):
+        super().__init__()
+        self.C, self.H, self.W, self.T = target_shape
+        self.r = rank
+
+        self.UH = TuckerFactor(self.H, self.r, is_complex=False, device=device)
+        self.UW = TuckerFactor(self.W, self.r, is_complex=False, device=device)
+        self.UC = TuckerFactor(self.C, self.r, is_complex=False, device=device)
+        self.UT = TuckerFactor(self.T, self.r, is_complex=False, device=device)
+
+    def forward(self, t):
+        UT = self.UT.get(t)
+        UC = self.UC()
+        UH = self.UH()
+        UW = self.UW()
+        return cp_construct(UT, UC, UH, UW).contiguous()
+
 class BasicUpres(nn.Module):
-    def __init__(self, in_channels, out_channels, hidden, k, device='cuda'):
+    def __init__(self, in_channels, out_channels, hidden, k, blocks, device='cuda'):
         super().__init__()
         half_k = k // 2
         self.k = k
@@ -265,9 +290,9 @@ class BasicUpres(nn.Module):
         self.layers = nn.ModuleList([
             nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
-            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden),
+            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden),
             nn.SiLU(inplace=True),
-            nn.Conv2d(hidden, hidden, kernel_size=1),
+            nn.Conv2d(hidden, hidden, 1),
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden),
             nn.SiLU(inplace=True),
@@ -301,7 +326,7 @@ class BasicUpres(nn.Module):
 
 
 class NikaBlock(nn.Module):
-    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, out_channels, device):
+    def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, upres_blocks, out_channels, device):
         super().__init__()
         self.C, self.H, self.W, self.T = target_shape
         self.H = int(self.H // k); self.W = int(self.W // k)
@@ -311,28 +336,33 @@ class NikaBlock(nn.Module):
             ranks=real_tucker_ranks,
             device=device,
         ).to(device)
+        torch.compile(self.real_tucker)
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
             ranks=complex_tucker_ranks,
             device=device,
         ).to(device)
+        torch.compile(self.complex_tucker)
 
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
             device=device,
         ).to(device)
+        torch.compile(self.grid_features)
 
         self.upres = BasicUpres(
             in_channels=3 * self.C,
             out_channels=out_channels,
             hidden=conv_hidden,
             k=k,
+            blocks=upres_blocks,
             device=device,
         ).to(device)
 
         self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
+        torch.compile(self.groupnorm)
         self.log_stats()
 
     def log_stats(self):
@@ -379,7 +409,6 @@ class NikaBlock(nn.Module):
 
 def feature_test(vid, name, config, device):
     batch_size = 10
-
     model_kwargs = REFERENCES[config]
     model = NikaBlock(
         target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
@@ -393,6 +422,7 @@ def feature_test(vid, name, config, device):
 
     best_psnr = float('-inf')
     best_epoch = -1
+
     for epoch in range(2000):
         opt.zero_grad(set_to_none=True)
         loss = 0.0
