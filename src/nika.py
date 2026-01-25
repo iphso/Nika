@@ -16,15 +16,8 @@ from PIL import Image
 
 from soap import SOAP
 import random
-
-
-def load_image(png_path, normalize=True, device='cuda', dtype=torch.float32):
-    png = iio.imread(png_path, plugin="pillow")  # H,W,3 uint8
-    if normalize:
-        png = png.astype(np.float32) / 255.0
-    x = png.permute(2,0,1).contiguous()            # 3,H,W (CHW)
-    x = x.unsqueeze(0)                           # 1,3,H,W (BCHW)
-    return x.to(dtype)
+from load_data import load_video_frames
+from configs import REFERENCES
 
 
 def hermitian_project_shifted(Ks):
@@ -46,43 +39,6 @@ def hermitian_project_shifted(Ks):
         Ksym[..., mid, 0 ] = Ksym[..., mid, 0 ].real + 0j
         Ksym[..., mid, mid] = Ksym[..., mid, mid].real + 0j
     return torch.fft.fftshift(Ksym, dim=(-2, -1))  # back to SHIFTED
-
-
-def load_video_frames(
-    dir_path,
-    device="cuda",
-    dtype=torch.float32,
-    max_frames=100,
-    normalize=True,
-
-):
-    torch.cuda.set_device(device)
-    all_paths = sorted(glob.glob(f"{dir_path}/*.png"))
-    if not all_paths:
-        raise RuntimeError(f"No frames found in {dir_path}")
-    if len(all_paths) <= max_frames:
-        paths = all_paths
-    else:
-        paths = all_paths[:max_frames]
-    first = iio.imread(paths[0], plugin="pillow")
-    H, W = first.shape[:2]
-
-    # Preallocate CPU tensor (pinned for faster HtoD)
-    vid_cpu = torch.empty((len(paths), 3, H, W), dtype=dtype, pin_memory=True)
-
-    # Fill preallocated buffer
-    for t, p in enumerate(paths):
-        if t % 50 == 0:
-            print(f"Loading frame {t}/{len(paths)}")
-        if normalize:
-            arr = iio.imread(p, plugin="pillow").astype("float32") / 255.0
-        else:
-            arr = iio.imread(p, plugin="pillow")
-        arr = torch.from_numpy(arr)
-        lin = arr.permute(2, 0, 1).contiguous()         # 3,H,W
-        vid_cpu[t].copy_(lin)
-
-    return vid_cpu.to(device=device, dtype=dtype, non_blocking=True)
 
 
 class TuckerFactor(nn.Module):
@@ -160,25 +116,8 @@ class TuckerFactor(nn.Module):
         return U
 
     def get(self, target):
-        if self.chunked:
-            chunk_idx = target // self.max_chunk_size
-            rel_idx = target % self.max_chunk_size
-            if self.is_complex:
-                r_chunks = [self.real_chunks[c][r:r+1] for c, r in zip(chunk_idx, rel_idx)]
-                i_chunks = [self.imag_chunks[c][r:r+1] for c, r in zip(chunk_idx, rel_idx)]
-                U_target = torch.complex(torch.cat(r_chunks, dim=0), torch.cat(i_chunks, dim=0))
-            else:
-                chunks = [self.chunks[c][r:r+1] for c, r in zip(chunk_idx, rel_idx)]
-                U_target = torch.cat(chunks, dim=0)
-        else:
-            if self.is_complex:
-                U_target = torch.complex(
-                    self.U_real[target],
-                    self.U_imag[target],
-                )
-            else:
-                U_target = self.U[target]
-        return U_target
+        U = self.forward()
+        return U[target]
 
 
 class RealTucker(nn.Module):
@@ -236,48 +175,49 @@ class FeatureGrid(nn.Module):
         self.grid_w = grid_res[2]
         self.grid_t = grid_res[3]
 
-        # Initialize parameters to log of uniform random values in (0, 1)
-        self.grid = nn.Parameter(torch.log(torch.rand(self.grid_c, self.grid_h, self.grid_w, self.grid_t, device=device) + 1e-8))
+        self.grid = nn.Parameter(torch.randn(self.grid_c, self.grid_h, self.grid_w, self.grid_t, device=device) * 1e-2)
         self.channel_proj = nn.Linear(self.grid_c, self.C, bias=True).to(device)
+        nn.init.normal_(self.channel_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.channel_proj.bias)
+        self.register_buffer("_xy_base", None, persistent=False)
+        self._grid_5d_view = None
+        self._generate_xy_base()
 
-    def forward(self, t, target_H=None, target_W=None):
+    def _generate_xy_base(self):
         device = self.grid.device
-        H_out = target_H if target_H is not None else self.H
-        W_out = target_W if target_W is not None else self.W
+        y_lin = torch.arange(0, self.H, device=device)
+        x_lin = torch.arange(0, self.W, device=device)
+        y_norm = 2.0 * (y_lin / (self.H - 1)) - 1.0
+        x_norm = 2.0 * (x_lin / (self.W - 1)) - 1.0
+        y, x = torch.meshgrid(y_norm, x_norm, indexing='ij')  # [H, W]
+        self._xy_base = torch.stack((x, y), dim=-1)  # [H, W, 2]
+    
+    def _5d_grid(self):
+        return self.grid.permute(0, 3, 1, 2).unsqueeze(0)
 
+    def forward(self, t):
+        device = self.grid.device
         B = t.shape[0]
-        t_norm = (2.0 * t) - 1.0
-        y_lin = torch.linspace(0, self.H - 1, steps=H_out, device=device)
-        x_lin = torch.linspace(0, self.W - 1, steps=W_out, device=device)
-        y_norm = 2.0 * (y_lin / (self.H - 1)) - 1.0
-        x_norm = 2.0 * (x_lin / (self.W - 1)) - 1.0
 
-        y_lin = torch.linspace(0, self.H - 1, steps=H_out, device=device)
-        x_lin = torch.linspace(0, self.W - 1, steps=W_out, device=device)
-        y_norm = 2.0 * (y_lin / (self.H - 1)) - 1.0
-        x_norm = 2.0 * (x_lin / (self.W - 1)) - 1.0
+        sample_grid3 = torch.empty((B, self.H, self.W, 3), device=device, dtype=self._xy_base.dtype)
+        sample_grid3[..., :2] = self._xy_base
+        sample_grid3[..., 2] = (2.0 * t - 1.0).view(B, 1, 1)
 
-        y, x = torch.meshgrid(y_norm, x_norm, indexing='ij')  # [H_out, W_out]
-        y = y.expand(B, H_out, W_out)
-        x = x.expand(B, H_out, W_out)
-        t_grid = t_norm.view(B, 1, 1).expand(B, H_out, W_out)
-        sample_grid = torch.stack((x, y, t_grid), dim=-1)  # [B, H_out, W_out, 3]
-        sample_grid = sample_grid.unsqueeze(1)  # [B, 1, H_out, W_out, 3]
+        sample_grid3 = sample_grid3.unsqueeze(1)  # [B,1,H,W,3]
 
-        grid_5d = self.grid.permute(0, 3, 1, 2).unsqueeze(0)  # [1, C, T_g, H_g, W_g]
-        grid_5d = grid_5d.expand(B, -1, -1, -1, -1)  # [B, C, T_g, H_g, W_g]
+        grid_5d = self._5d_grid().expand(B, -1, -1, -1, -1)
 
         sampled = F.grid_sample(
             grid_5d,               # [B, C, T_g, H_g, W_g]
-            sample_grid,           # [B, 1, H_out, W_out, 3]
+            sample_grid3,           # [B, 1, H_out, W_out, 3]
             mode='bilinear',
             align_corners=True,
             padding_mode='border',
         )  # → [B, C, 1, H_out, W_out]
 
         sampled = sampled.squeeze(2).permute(0, 2, 3, 1)  # [B, H_out, W_out, C]
-        sampled = self.channel_proj(sampled).permute(0, 3, 1, 2)  # [B, C, H_out, W_out]
-        return sampled.contiguous()
+        result = self.channel_proj(sampled).permute(0, 3, 1, 2)  # [B, C, H_out, W_out]
+        return result.contiguous()
 
 
 def tucker_construct(UT, UC, UH, UW, G):
@@ -297,6 +237,8 @@ def tucker_construct(UT, UC, UH, UW, G):
 
     UH = _col_norm(UH)
     UW = _col_norm(UW)
+    UC = _col_norm(UC)
+    UT = _col_norm(UT)
 
     X = torch.einsum('ijkl,tl,ck,hi,wj->tchw', G, UT, UC, UH, UW)
     return X
@@ -345,34 +287,42 @@ class BasicUpres(nn.Module):
         half_k = k // 2
         self.k = k
 
-        layers = [
+        self.layers = nn.ModuleList([
             nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
-        ]
-        for _ in range(blocks):
-            layers += [
-            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden),
+            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden),
             nn.SiLU(inplace=True),
-            nn.Conv2d(hidden, hidden, kernel_size=1),
+            nn.Conv2d(hidden, hidden, 1),
             nn.SiLU(inplace=True),
-            ]
-        layers += [
-            nn.Conv2d(hidden, out_channels * (k ** 2), kernel_size=3, padding=1),
+            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, out_channels * (k ** 2), kernel_size=1),
             nn.PixelShuffle(upscale_factor=k),
-        ]
-        self.upres = nn.Sequential(*layers).to(device)
+        ])
+        self.upres = nn.Sequential(*self.layers).to(device)
 
-        # xavier init
+        #kaiming init
         for m in self.upres.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.xavier_uniform_(m.weight)
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x):
-        self.inputs = x
-        upres_kernel = self.upres(x)
-        return upres_kernel
+    def forward(self, x, log_times=False):
+        if not log_times:
+            return self.upres(x)
+        times = []
+        inp = x
+        for idx, layer in enumerate(self.layers):
+            torch.cuda.synchronize()
+            start = time.time()
+            inp = layer(inp)
+            torch.cuda.synchronize()
+            elapsed = time.time() - start
+            times.append((type(layer).__name__, elapsed))
+        for i, (name, t) in enumerate(times):
+            print(f"Layer {i}: {name} took {t*1000:.3f} ms")
+        return inp
 
 
 class NikaBlock(nn.Module):
@@ -410,7 +360,6 @@ class NikaBlock(nn.Module):
             blocks=upres_blocks,
             device=device,
         ).to(device)
-        torch.compile(self.upres)
 
         self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
         torch.compile(self.groupnorm)
@@ -430,16 +379,18 @@ class NikaBlock(nn.Module):
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
     def forward(self, t):
+        if type(t) is not torch.Tensor:
+            t = torch.tensor([t], device=self.grid_features.grid.device, dtype=torch.int64)
         grid_out = self.grid_features(t / (self.T - 1))
         real_tucker_out = self.real_tucker(t)
         complex_tucker_out = self.complex_tucker(t)
-        normed_input = torch.cat([grid_out, real_tucker_out, complex_tucker_out], dim=1)
-        core_input = self.groupnorm(normed_input)
-        refined = self.upres(core_input)
+        base_input = torch.cat([grid_out, real_tucker_out, complex_tucker_out], dim=1)
+        normed_input = self.groupnorm(base_input)
+        refined = self.upres(normed_input)
         return refined
 
     def test_images(self, output_dir):
-        self.eval()
+        # self.eval()
         with torch.no_grad():
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
@@ -456,149 +407,66 @@ class NikaBlock(nn.Module):
                 save_image(img, f"{output_dir}/frame_{i:04d}.png")
 
 
-def feature_test(vid, device):
+def feature_test(vid, name, config, device):
     batch_size = 10
-    # reference sizes
-    # 3.3M config
-    # small_grid_ranks = [2, 60, 70, 120]  # 1M params
-    # small_real_tucker = [2, 80, 80, 80]  # 1.1M params
-    # small_complex_tucker = [2, 60, 60, 60]  # 1M params
-    # small_hidden = 150  # 0.1M params
-    # small_upres_blocks = 1
-    small_grid_ranks = [2, 60, 70, 120]
-    small_real_tucker = [2, 80, 80, 80]
-    small_complex_tucker = [2, 60, 60, 60]
-    small_hidden = 150
-    small_upres_blocks = 1
-
-    # 6M config
-    # medium_grid_ranks = [3, 70, 80, 130]
-    # medium_real_tucker = [3, 85, 85, 85]
-    # medium_complex_tucker = [3, 65, 65, 65]
-    # medium_hidden = 200
-
-    medium_grid_ranks = [2, 80, 90, 150]
-    medium_real_tucker = [2, 100, 100, 100]
-    medium_complex_tucker = [2, 70, 70, 70]
-    medium_hidden = 200
-    medium_upres_blocks = 1
-
+    model_kwargs = REFERENCES[config]
     model = NikaBlock(
-        target_shape=[3, vid.shape[2], vid.shape[3], vid.shape[0]],
+        target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
         k=4,
-        real_tucker_ranks=medium_real_tucker,
-        complex_tucker_ranks=medium_complex_tucker,
-        grid_ranks=medium_grid_ranks,
-        conv_hidden=medium_hidden,
-        upres_blocks=medium_upres_blocks,
+        **model_kwargs,
         out_channels=3,
         device=device,
     )
 
     opt = SOAP(list(model.parameters()), lr=1e-2)
+
+    best_psnr = float('-inf')
+    best_epoch = -1
 
     for epoch in range(2000):
         opt.zero_grad(set_to_none=True)
         loss = 0.0
         start_time = time.time()
-        for t in range(vid.shape[0] // batch_size):
-            min_t = t * batch_size; max_t = (t + 1) * batch_size
+        num_batches = (vid.shape[0] + batch_size - 1) // batch_size
+        for t in range(num_batches):
+            min_t = t * batch_size
+            max_t = min((t + 1) * batch_size, vid.shape[0])
             batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
-            t_batch = torch.linspace(min_t, max_t - 1, steps=(max_t - min_t), dtype=torch.int64, device=device)
+            t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
             prediction = model(t_batch)
             mse = F.mse_loss(prediction, batch_gt)
             psnr = -10.0 * torch.log10(mse + 1e-8)
-            frame_loss = (-psnr).mean() / (vid.shape[0] // batch_size)
+            frame_loss = (-psnr).mean() / num_batches
             frame_loss.backward()
             loss += frame_loss
         average_frame_time = (time.time() - start_time) / vid.shape[0]
-        print(f"Epoch {epoch} loss: {loss.item():.4f}, time: {average_frame_time:.5f}s")
+        epoch_psnr = -loss.item()
+        print(f"Epoch {epoch} loss: {loss.item():.4f}, time: {average_frame_time:.5f}s, PSNR: {epoch_psnr:.2f}")
+
+        if epoch_psnr > best_psnr and (epoch - best_epoch >= 10 or best_epoch == -1):
+            best_psnr = epoch_psnr
+            best_epoch = epoch
+            model_path = f"models/{config}-{name}-epoch{epoch}-psnr{best_psnr:.2f}.torch"
+            torch.save(model.state_dict(), model_path)
+            os.sync()
+            print(f"New best model saved at epoch {epoch} with PSNR: {best_psnr:.2f}")
+
         opt.step()
 
         if epoch % 25 == 0:
-            batch_psnr = loss.item() * -1.0
-            print(f"Epoch {epoch}: Tucker PSNR: {batch_psnr:.2f}")
+            print(f"Epoch {epoch}: Tucker PSNR: {epoch_psnr:.2f}")
             model.test_images("out_feature_test")
 
-    torch.save(model.state_dict(), "models/beauty-model.torch")
-
-
-def explain(vid, device):
-    from torch.autograd import grad
-    batch_size = 1
-
-    # reference sizes
-    # 3.3M config
-    small_grid_ranks = [2, 60, 70, 120]  # 1M params
-    small_real_tucker = [2, 80, 80, 80]  # 1.1M params
-    small_complex_tucker = [2, 60, 60, 60]  # 1M params
-    small_hidden = 150  # 0.1M params
-
-    model = NikaBlock(
-        target_shape=[3, vid.shape[2], vid.shape[3], vid.shape[0]],
-        k=4,
-        real_tucker_ranks=small_real_tucker,
-        complex_tucker_ranks=small_complex_tucker,
-        grid_ranks=small_grid_ranks,
-        conv_hidden=small_hidden,
-        out_channels=3,
-        device=device,
-    )
-    model.load_state_dict(torch.load("models/beauty-model.torch"))
-    model.eval()
-
-    opt = SOAP(list(model.parameters()), lr=1e-2)
-
-    opt.zero_grad(set_to_none=True)
-    loss = 0.0
-    start_time = time.time()
-
-    def rescale(img):
-        rescaled = (img - img.min()) / (img.max() - img.min())
-        return rescaled
-
-    for t in range(vid.shape[0] // batch_size):
-        min_t = t * batch_size; max_t = (t + 1) * batch_size
-        batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
-        t_batch = torch.linspace(min_t, max_t - 1, steps=(max_t - min_t), dtype=torch.int64, device=device)
-        prediction = model(t_batch)
-        pixel_sum = prediction.sum()
-        upres_input_grad = grad(pixel_sum, model.upres.inputs)[0]
-        contributions = upres_input_grad.abs().mean(dim=(2, 3))
-        print(contributions)
-        absed = []
-        for i in range(9):
-            save_image(rescale(upres_input_grad[0,i,...]), f"visuals/frame0_channel{i}.png")
-            abs_i = rescale(upres_input_grad[0,i,...]).abs()
-            save_image(abs_i, f"visuals/frame0_channel{i}_abs.png")
-            absed.append(abs_i)
-
-        intensities = []
-        for start in range(0, 9, 3):
-            combined = torch.stack(absed[start:start+3], axis=0)
-            intensity = combined.norm(dim=0)
-            intensities.append(intensity)
-            intensity = intensity / intensity.max()
-            names = {
-                0: 'real',
-                3: 'imaginary',
-                6: 'feature_grid'
-            }
-            save_image(combined, f"visuals/{names[start]}_independent_norm.png")
-            save_image(intensity, f"visuals/{names[start]}_intensity.png")
-
-        save_image(rescale(torch.stack(intensities, axis=0)), "visuals/merge_all_the_things.png")
-        save_image(rescale(upres_input_grad[0,:3,...]), "visuals/real_branch_frame0.png")
-        save_image(rescale(upres_input_grad[0,3:6,...]), "visuals/imaginary_branch_frame0.png")
-        save_image(rescale(upres_input_grad[0,6:,...]), "visuals/feature_grid_branch_frame0.png")
-        save_image(rescale(upres_input_grad[0,:3,...]).abs(), "visuals/real_branch_abs_frame0.png")
-        save_image(rescale(upres_input_grad[0,3:6,...]).abs(), "visuals/imaginary_branch_abs_frame0.png")
-        save_image(rescale(upres_input_grad[0,6:,...]).abs(), "visuals/feature_grid_branch_abs_frame0.png")
-        import pdb; pdb.set_trace()
+    print(f"Best PSNR achieved: {best_psnr:.2f} at epoch {best_epoch}")
 
 
 if __name__ == "__main__":
     device = "cuda:1"
-    vid = load_video_frames("static/benchmarks/uvg/jockey", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    name = "bunny"
+    vid = load_video_frames(f"static/benchmarks/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     # explain(vid, device=device)
-    feature_test(vid, device=device)
+    feature_test(vid, name, "xxs", device=device)
+    # batch_profile(vid, device=device, batch_sizes=(1, 5, 10), iters=10, warmup=5)

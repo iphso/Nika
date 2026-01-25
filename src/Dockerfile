@@ -28,6 +28,7 @@ RUN pip install numpy \
                 tensorboard \
                 opencv-python \
                 imageio[ffmpeg] \
-                imageio-ffmpeg
+                imageio-ffmpeg \
+                scikit-video
 
 EXPOSE 6006
