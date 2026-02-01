@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jockey Ablations - Nika</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <main class="container">
+        <a href="../../index.html" class="back-link">&larr; Back to Gallery</a>
+
+        <div class="detail-header">
+            <h1>Jockey Ablations</h1>
+            <a href="../jockey.html" class="psnr-badge">View baseline</a>
+        </div>
+
+        <p class="ablation-intro">
+            Ablation comparisons for Jockey. Each model variant is shown with its
+            side-by-side reconstruction video and error visualizations.
+        </p>
+
+        <section class="ablation-grid">
+            
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>tucker-small</h2>
+                    <span class="psnr-badge">PSNR: 31.28 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1498</span>
+                    <span>Config: tucker-small</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/tucker-small-jockey-epoch1498-psnr31.28_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/tucker-small-jockey-epoch1498-psnr31.28_error_over_time.png"
+                             alt="Jockey error over time (tucker-small)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/tucker-small-jockey-epoch1498-psnr31.28_spatial_heatmap.png"
+                             alt="Jockey spatial heatmap (tucker-small)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>real-small</h2>
+                    <span class="psnr-badge">PSNR: 30.16 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1492</span>
+                    <span>Config: real-small</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/real-small-jockey-epoch1492-psnr30.16_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/real-small-jockey-epoch1492-psnr30.16_error_over_time.png"
+                             alt="Jockey error over time (real-small)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/real-small-jockey-epoch1492-psnr30.16_spatial_heatmap.png"
+                             alt="Jockey spatial heatmap (real-small)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>weird-nika</h2>
+                    <span class="psnr-badge">PSNR: 30.19 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1485</span>
+                    <span>Config: weird-nika</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/weird-nika-jockey-epoch1485-psnr30.19_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/weird-nika-jockey-epoch1485-psnr30.19_error_over_time.png"
+                             alt="Jockey error over time (weird-nika)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/weird-nika-jockey-epoch1485-psnr30.19_spatial_heatmap.png"
+                             alt="Jockey spatial heatmap (weird-nika)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>noconv-nika</h2>
+                    <span class="psnr-badge">PSNR: 26.68 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1491</span>
+                    <span>Config: noconv-nika</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/noconv-nika-jockey-epoch1491-psnr26.68_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/noconv-nika-jockey-epoch1491-psnr26.68_error_over_time.png"
+                             alt="Jockey error over time (noconv-nika)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/noconv-nika-jockey-epoch1491-psnr26.68_spatial_heatmap.png"
+                             alt="Jockey spatial heatmap (noconv-nika)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+        </section>
+
+        <nav class="video-nav">
+            <a href="honey.html" class="nav-link">&larr; Honey</a>
+            <a href="ready.html" class="nav-link">Ready &rarr;</a>
+        </nav>
+    </main>
+
+    <div class="lightbox" id="lightbox">
+        <button class="lightbox-close">&times;</button>
+        <img src="" alt="Enlarged view">
+    </div>
+
+    <footer>
+        <p>Nika - Neural Implicit Video Representations</p>
+    </footer>
+
+    <script src="../../js/main.js"></script>
+</body>
+</html>

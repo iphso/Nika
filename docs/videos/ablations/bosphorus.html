@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bosphorus Ablations - Nika</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <main class="container">
+        <a href="../../index.html" class="back-link">&larr; Back to Gallery</a>
+
+        <div class="detail-header">
+            <h1>Bosphorus Ablations</h1>
+            <a href="../bosphorus.html" class="psnr-badge">View baseline</a>
+        </div>
+
+        <p class="ablation-intro">
+            Ablation comparisons for Bosphorus. Each model variant is shown with its
+            side-by-side reconstruction video and error visualizations.
+        </p>
+
+        <section class="ablation-grid">
+            
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>tucker-small</h2>
+                    <span class="psnr-badge">PSNR: 33.60 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1497</span>
+                    <span>Config: tucker-small</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/tucker-small-bosphorus-epoch1497-psnr33.60_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/tucker-small-bosphorus-epoch1497-psnr33.60_error_over_time.png"
+                             alt="Bosphorus error over time (tucker-small)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/tucker-small-bosphorus-epoch1497-psnr33.60_spatial_heatmap.png"
+                             alt="Bosphorus spatial heatmap (tucker-small)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>real-small</h2>
+                    <span class="psnr-badge">PSNR: 32.60 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1488</span>
+                    <span>Config: real-small</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/real-small-bosphorus-epoch1488-psnr32.60_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/real-small-bosphorus-epoch1488-psnr32.60_error_over_time.png"
+                             alt="Bosphorus error over time (real-small)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/real-small-bosphorus-epoch1488-psnr32.60_spatial_heatmap.png"
+                             alt="Bosphorus spatial heatmap (real-small)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>weird-nika</h2>
+                    <span class="psnr-badge">PSNR: 32.10 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1478</span>
+                    <span>Config: weird-nika</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/weird-nika-bosphorus-epoch1478-psnr32.10_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/weird-nika-bosphorus-epoch1478-psnr32.10_error_over_time.png"
+                             alt="Bosphorus error over time (weird-nika)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/weird-nika-bosphorus-epoch1478-psnr32.10_spatial_heatmap.png"
+                             alt="Bosphorus spatial heatmap (weird-nika)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>noconv-nika</h2>
+                    <span class="psnr-badge">PSNR: 29.98 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1492</span>
+                    <span>Config: noconv-nika</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/noconv-nika-bosphorus-epoch1492-psnr29.98_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/noconv-nika-bosphorus-epoch1492-psnr29.98_error_over_time.png"
+                             alt="Bosphorus error over time (noconv-nika)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/noconv-nika-bosphorus-epoch1492-psnr29.98_spatial_heatmap.png"
+                             alt="Bosphorus spatial heatmap (noconv-nika)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+        </section>
+
+        <nav class="video-nav">
+            <a href="beauty.html" class="nav-link">&larr; Beauty</a>
+            <a href="honey.html" class="nav-link">Honey &rarr;</a>
+        </nav>
+    </main>
+
+    <div class="lightbox" id="lightbox">
+        <button class="lightbox-close">&times;</button>
+        <img src="" alt="Enlarged view">
+    </div>
+
+    <footer>
+        <p>Nika - Neural Implicit Video Representations</p>
+    </footer>
+
+    <script src="../../js/main.js"></script>
+</body>
+</html>

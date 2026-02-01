@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Yacht Ablations - Nika</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <main class="container">
+        <a href="../../index.html" class="back-link">&larr; Back to Gallery</a>
+
+        <div class="detail-header">
+            <h1>Yacht Ablations</h1>
+            <a href="../yacht.html" class="psnr-badge">View baseline</a>
+        </div>
+
+        <p class="ablation-intro">
+            Ablation comparisons for Yacht. Each model variant is shown with its
+            side-by-side reconstruction video and error visualizations.
+        </p>
+
+        <section class="ablation-grid">
+            
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>tucker-small</h2>
+                    <span class="psnr-badge">PSNR: 27.82 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1489</span>
+                    <span>Config: tucker-small</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/tucker-small-yacht-epoch1489-psnr27.82_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/tucker-small-yacht-epoch1489-psnr27.82_error_over_time.png"
+                             alt="Yacht error over time (tucker-small)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/tucker-small-yacht-epoch1489-psnr27.82_spatial_heatmap.png"
+                             alt="Yacht spatial heatmap (tucker-small)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>real-small</h2>
+                    <span class="psnr-badge">PSNR: 27.11 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1494</span>
+                    <span>Config: real-small</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/real-small-yacht-epoch1494-psnr27.11_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/real-small-yacht-epoch1494-psnr27.11_error_over_time.png"
+                             alt="Yacht error over time (real-small)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/real-small-yacht-epoch1494-psnr27.11_spatial_heatmap.png"
+                             alt="Yacht spatial heatmap (real-small)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>weird-nika</h2>
+                    <span class="psnr-badge">PSNR: 27.16 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1488</span>
+                    <span>Config: weird-nika</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/weird-nika-yacht-epoch1488-psnr27.16_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/weird-nika-yacht-epoch1488-psnr27.16_error_over_time.png"
+                             alt="Yacht error over time (weird-nika)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/weird-nika-yacht-epoch1488-psnr27.16_spatial_heatmap.png"
+                             alt="Yacht spatial heatmap (weird-nika)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>noconv-nika</h2>
+                    <span class="psnr-badge">PSNR: 25.07 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1490</span>
+                    <span>Config: noconv-nika</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/noconv-nika-yacht-epoch1490-psnr25.07_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/noconv-nika-yacht-epoch1490-psnr25.07_error_over_time.png"
+                             alt="Yacht error over time (noconv-nika)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/noconv-nika-yacht-epoch1490-psnr25.07_spatial_heatmap.png"
+                             alt="Yacht spatial heatmap (noconv-nika)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+        </section>
+
+        <nav class="video-nav">
+            <a href="shake.html" class="nav-link">&larr; Shake</a>
+            <span class="nav-link disabled">Yacht &rarr;</span>
+        </nav>
+    </main>
+
+    <div class="lightbox" id="lightbox">
+        <button class="lightbox-close">&times;</button>
+        <img src="" alt="Enlarged view">
+    </div>
+
+    <footer>
+        <p>Nika - Neural Implicit Video Representations</p>
+    </footer>
+
+    <script src="../../js/main.js"></script>
+</body>
+</html>

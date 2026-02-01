@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ready Ablations - Nika</title>
+    <link rel="stylesheet" href="../../css/style.css">
+</head>
+<body>
+    <main class="container">
+        <a href="../../index.html" class="back-link">&larr; Back to Gallery</a>
+
+        <div class="detail-header">
+            <h1>Ready Ablations</h1>
+            <a href="../ready.html" class="psnr-badge">View baseline</a>
+        </div>
+
+        <p class="ablation-intro">
+            Ablation comparisons for Ready. Each model variant is shown with its
+            side-by-side reconstruction video and error visualizations.
+        </p>
+
+        <section class="ablation-grid">
+            
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>tucker-small</h2>
+                    <span class="psnr-badge">PSNR: 24.15 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1491</span>
+                    <span>Config: tucker-small</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/tucker-small-ready-epoch1491-psnr24.15_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/tucker-small-ready-epoch1491-psnr24.15_error_over_time.png"
+                             alt="Ready error over time (tucker-small)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/tucker-small-ready-epoch1491-psnr24.15_spatial_heatmap.png"
+                             alt="Ready spatial heatmap (tucker-small)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>real-small</h2>
+                    <span class="psnr-badge">PSNR: 23.37 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1495</span>
+                    <span>Config: real-small</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/real-small-ready-epoch1495-psnr23.37_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/real-small-ready-epoch1495-psnr23.37_error_over_time.png"
+                             alt="Ready error over time (real-small)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/real-small-ready-epoch1495-psnr23.37_spatial_heatmap.png"
+                             alt="Ready spatial heatmap (real-small)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>weird-nika</h2>
+                    <span class="psnr-badge">PSNR: 23.91 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1490</span>
+                    <span>Config: weird-nika</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/weird-nika-ready-epoch1490-psnr23.91_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/weird-nika-ready-epoch1490-psnr23.91_error_over_time.png"
+                             alt="Ready error over time (weird-nika)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/weird-nika-ready-epoch1490-psnr23.91_spatial_heatmap.png"
+                             alt="Ready spatial heatmap (weird-nika)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+            <article class="ablation-card">
+                <div class="ablation-card-header">
+                    <h2>noconv-nika</h2>
+                    <span class="psnr-badge">PSNR: 21.22 dB</span>
+                </div>
+                <div class="ablation-meta">
+                    <span>Epoch 1491</span>
+                    <span>Config: noconv-nika</span>
+                </div>
+                <div class="ablation-video">
+                    <video controls preload="metadata">
+                        <source src="https://nikanet.com/videos/noconv-nika-ready-epoch1491-psnr21.22_comparison.mp4" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+                <div class="ablation-plots">
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/noconv-nika-ready-epoch1491-psnr21.22_error_over_time.png"
+                             alt="Ready error over time (noconv-nika)"
+                             class="lightbox-trigger">
+                        <p>Error over time</p>
+                    </div>
+                    <div class="ablation-plot">
+                        <img src="https://nikanet.com/videos/noconv-nika-ready-epoch1491-psnr21.22_spatial_heatmap.png"
+                             alt="Ready spatial heatmap (noconv-nika)"
+                             class="lightbox-trigger">
+                        <p>Spatial heatmap</p>
+                    </div>
+                </div>
+            </article>
+        
+        </section>
+
+        <nav class="video-nav">
+            <a href="jockey.html" class="nav-link">&larr; Jockey</a>
+            <a href="shake.html" class="nav-link">Shake &rarr;</a>
+        </nav>
+    </main>
+
+    <div class="lightbox" id="lightbox">
+        <button class="lightbox-close">&times;</button>
+        <img src="" alt="Enlarged view">
+    </div>
+
+    <footer>
+        <p>Nika - Neural Implicit Video Representations</p>
+    </footer>
+
+    <script src="../../js/main.js"></script>
+</body>
+</html>
