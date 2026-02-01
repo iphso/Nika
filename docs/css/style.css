@@ -379,6 +379,28 @@ footer {
     font-weight: 500;
 }
 
+.model-divider {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-left: 0.5rem;
+}
+
+.model-divider::before {
+    content: '';
+    width: 1px;
+    height: 1.5rem;
+    background: var(--border);
+}
+
+.model-button.ablation {
+    border-style: dashed;
+}
+
 /* Tabs */
 .tabs {
     margin-bottom: 2rem;
