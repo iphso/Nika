@@ -131,7 +131,7 @@ class RealTucker(nn.Module):
         self.UC = TuckerFactor(self.C, self.rC, is_complex=False, device=device)
         self.UT = TuckerFactor(self.T, self.rT, is_complex=False, device=device)
 
-        self.G = nn.Parameter(torch.randn(self.rH, self.rW, self.rC, self.rT, device=device) * 1e-2)
+        self.G = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
 
     def forward(self, t):
         UT = self.UT.get(t)
@@ -151,8 +151,8 @@ class ComplexTucker(RealTucker):
         self.UT = TuckerFactor(self.T, self.rT, is_complex=True, device=device)
 
         self.G = None  # override parent
-        self.G_real = nn.Parameter(torch.randn(self.rH, self.rW, self.rC, self.rT, device=device) * 1e-2)
-        self.G_imag = nn.Parameter(torch.zeros(self.rH, self.rW, self.rC, self.rT, device=device))
+        self.G_real = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
+        self.G_imag = nn.Parameter(torch.zeros(self.rT, self.rC, self.rH, self.rW, device=device))
 
     def forward(self, t):
         UH = self.UH()
@@ -240,46 +240,9 @@ def tucker_construct(UT, UC, UH, UW, G):
     UC = _col_norm(UC)
     UT = _col_norm(UT)
 
-    X = torch.einsum('ijkl,tl,ck,hi,wj->tchw', G, UT, UC, UH, UW)
+    X = torch.einsum('ijkl,ti,cj,hk,wl->tchw', G, UT, UC, UH, UW)
     return X
 
-
-def cp_construct(UT, UC, UH, UW):
-    UT = UT.contiguous()
-    UC = UC.contiguous()
-    UH = UH.contiguous()
-    UW = UW.contiguous()
-
-    r = UT.shape[1]
-    T, C, H, W = UT.shape[0], UC.shape[0], UH.shape[0], UW.shape[0]
-
-    assert UC.shape[1] == r and UH.shape[1] == r and UW.shape[1] == r
-
-    X = torch.zeros((T, C, H, W), device=UT.device, dtype=UT.dtype)
-
-    for i in range(r):
-        outer_product = torch.einsum('t,c,h,w->tc hw', UT[:, i], UC[:, i], UH[:, i], UW[:, i])
-        X += outer_product.reshape(T, C, H, W)
-
-    return X
-
-class FactorizedCore(nn.Module):
-    def __init__(self, target_shape, rank, device='cuda'):
-        super().__init__()
-        self.C, self.H, self.W, self.T = target_shape
-        self.r = rank
-
-        self.UH = TuckerFactor(self.H, self.r, is_complex=False, device=device)
-        self.UW = TuckerFactor(self.W, self.r, is_complex=False, device=device)
-        self.UC = TuckerFactor(self.C, self.r, is_complex=False, device=device)
-        self.UT = TuckerFactor(self.T, self.r, is_complex=False, device=device)
-
-    def forward(self, t):
-        UT = self.UT.get(t)
-        UC = self.UC()
-        UH = self.UH()
-        UW = self.UW()
-        return cp_construct(UT, UC, UH, UW).contiguous()
 
 class BasicUpres(nn.Module):
     def __init__(self, in_channels, out_channels, hidden, k, device='cuda'):
@@ -288,14 +251,12 @@ class BasicUpres(nn.Module):
         self.k = k
 
         self.layers = nn.ModuleList([
-            nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
+            nn.Conv2d(in_channels, hidden, 1),
+            nn.GELU(),
             nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden),
-            nn.SiLU(inplace=True),
+            nn.GELU(),
             nn.Conv2d(hidden, hidden, 1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden),
-            nn.SiLU(inplace=True),
+            nn.GELU(),
             nn.Conv2d(hidden, out_channels * (k ** 2), kernel_size=1),
             nn.PixelShuffle(upscale_factor=k),
         ])
@@ -325,6 +286,38 @@ class BasicUpres(nn.Module):
         return inp
 
 
+class ConvOperator(nn.Module):
+    def __init__(self, in_channels, out_channels, h_dim, device='cuda'):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.device = device
+
+        self.operator = nn.Sequential(
+            nn.Conv2d(in_channels, h_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(h_dim, h_dim, kernel_size=3, padding=1, groups=h_dim),
+            nn.GELU(),
+            nn.Conv2d(h_dim, h_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(h_dim, h_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(h_dim, out_channels, kernel_size=1),
+        ).to(device)
+
+        # zero init last conv layer
+        nn.init.zeros_(self.operator[-1].weight)
+
+    def forward(self, x):
+        if x.all() == 0:
+            return torch.zeros(
+                (x.shape[0], self.out_channels, x.shape[2], x.shape[3]),
+                device=self.device,
+                dtype=x.dtype,
+            )
+        return self.operator(x)
+
+
 class NikaBlock(nn.Module):
     def __init__(self, target_shape, k, real_tucker_ranks, complex_tucker_ranks, grid_ranks, conv_hidden, out_channels, device):
         super().__init__()
@@ -335,22 +328,39 @@ class NikaBlock(nn.Module):
             target_shape=self.internal_shape,
             ranks=real_tucker_ranks,
             device=device,
-        ).to(device)
+        )
         torch.compile(self.real_tucker)
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
             ranks=complex_tucker_ranks,
             device=device,
-        ).to(device)
+        )
         torch.compile(self.complex_tucker)
 
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
             device=device,
-        ).to(device)
+        )
         torch.compile(self.grid_features)
+
+        self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
+        torch.compile(self.groupnorm)
+
+        self.forward_operator = ConvOperator(
+            in_channels = 3 * self.C,
+            out_channels = 3 * self.C,
+            h_dim = 64,
+            device = device,
+        )
+
+        self.backward_operator = ConvOperator(
+            in_channels = 3 * self.C,
+            out_channels = 3 * self.C,
+            h_dim = 64,
+            device = device,
+        )
 
         self.upres = BasicUpres(
             in_channels=3 * self.C,
@@ -358,10 +368,8 @@ class NikaBlock(nn.Module):
             hidden=conv_hidden,
             k=k,
             device=device,
-        ).to(device)
+        )
 
-        self.groupnorm = nn.GroupNorm(num_groups=3, num_channels=3 * self.C).to(device)
-        torch.compile(self.groupnorm)
         self.log_stats()
 
     def log_stats(self):
@@ -369,11 +377,14 @@ class NikaBlock(nn.Module):
         complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
         grid_params = sum(p.numel() for p in self.grid_features.parameters())
         upres_params = sum(p.numel() for p in self.upres.parameters())
-        total_params = real_tucker_params + complex_tucker_params + grid_params + upres_params
+        operator_params = sum(p.numel() for p in self.forward_operator.parameters()) + sum(p.numel() for p in self.backward_operator.parameters())
+        total_params = real_tucker_params + complex_tucker_params + grid_params + upres_params + operator_params
         print(f"NikaBlock parameters:")
         print(f"  Real Tucker:     {real_tucker_params / 1e6:.3f}M")
         print(f"  Complex Tucker:  {complex_tucker_params / 1e6:.3f}M")
         print(f"  Feature Grid:    {grid_params / 1e6:.3f}M")
+        print(f"  Forward Operator:{sum(p.numel() for p in self.forward_operator.parameters()) / 1e6:.3f}M")
+        print(f"  Backward Operator:{sum(p.numel() for p in self.backward_operator.parameters()) / 1e6:.3f}M")
         print(f"  Upsampling CNN:  {upres_params / 1e6:.3f}M")
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
@@ -384,8 +395,35 @@ class NikaBlock(nn.Module):
         real_tucker_out = self.real_tucker(t)
         complex_tucker_out = self.complex_tucker(t)
         base_input = torch.cat([grid_out, real_tucker_out, complex_tucker_out], dim=1)
-        normed_input = self.groupnorm(base_input)
-        refined = self.upres(normed_input)
+        base_input = self.groupnorm(base_input)
+
+        forward_prediction = torch.zeros_like(base_input)
+        backward_prediction = torch.zeros_like(base_input)
+
+        mask_prev = (t > 0)
+        if mask_prev.any():
+            t_prev = (t[mask_prev] - 1)
+            grid_prev = self.grid_features(t_prev / (self.T - 1))
+            real_prev = self.real_tucker(t_prev)
+            complex_prev = self.complex_tucker(t_prev)
+            base_prev = torch.cat([grid_prev, real_prev, complex_prev], dim=1)
+            base_prev = self.groupnorm(base_prev)
+            forward_prediction[mask_prev] = base_prev
+        forward_prediction = self.forward_operator(forward_prediction)
+
+        mask_next = (t < (self.T - 1))
+        if mask_next.any():
+            t_next = (t[mask_next] + 1)
+            grid_next = self.grid_features(t_next / (self.T - 1))
+            real_next = self.real_tucker(t_next)
+            complex_next = self.complex_tucker(t_next)
+            base_next = torch.cat([grid_next, real_next, complex_next], dim=1)
+            base_next = self.groupnorm(base_next)
+            backward_prediction[mask_next] = base_next
+        backward_prediction = self.backward_operator(backward_prediction)
+
+        aggregated = base_input + forward_prediction + backward_prediction
+        refined = self.upres(aggregated)
         return refined
 
     def test_images(self, output_dir):
@@ -462,10 +500,9 @@ def feature_test(vid, name, config, device):
 if __name__ == "__main__":
     device = "cuda:1"
     name = "beauty"
+    torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    # explain(vid, device=device)
     feature_test(vid, name, "small", device=device)
-    # batch_profile(vid, device=device, batch_sizes=(1, 5, 10), iters=10, warmup=5)
