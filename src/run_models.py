@@ -174,7 +174,7 @@ def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None,
                 out_base = model(t_batch)
 
             # zeroed variants use forward flags
-            if 'no_tucker' in variants:
+            if 'only_grid' in variants:
                 out_no_tucker = model(t_batch, zero_real_tucker=True, zero_complex_tucker=True)
             if 'only_realt' in variants:
                 out_zero_real = model(t_batch, zero_complex_tucker=True, zero_feature_grid=True)
@@ -195,8 +195,8 @@ def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None,
                 idx = min_t + i
                 if 'baseline' in variants:
                     save_image(out_base[i], f"visuals/{vid_name}/{config}/baseline/preds/pred_frame{idx:03d}.png")
-                if 'no_tucker' in variants:
-                    save_image(out_no_tucker[i], f"visuals/{vid_name}/{config}/no_tucker/preds/pred_frame{idx:03d}.png")
+                if 'only_grid' in variants:
+                    save_image(out_no_tucker[i], f"visuals/{vid_name}/{config}/only_grid/preds/pred_frame{idx:03d}.png")
                 if 'only_realt' in variants:
                     save_image(out_zero_real[i], f"visuals/{vid_name}/{config}/only_realt/preds/pred_frame{idx:03d}.png")
                 if 'only_complext' in variants:
@@ -214,11 +214,11 @@ def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None,
             if v == 'forward_backward_upres':
                 fwd_src = f"visuals/{vid_name}/{config}/{v}/forward/preds"
                 bwd_src = f"visuals/{vid_name}/{config}/{v}/backward/preds"
-                make_mp4(fwd_src, output_path=f"visuals/{vid_name}/{config}/{v}/forward.mp4", base_name="pred_frame", fps=24)
-                make_mp4(bwd_src, output_path=f"visuals/{vid_name}/{config}/{v}/backward.mp4", base_name="pred_frame", fps=24)
+                make_mp4(fwd_src, output_path=f"visuals/{vid_name}/{config}/forward.mp4", base_name="pred_frame", fps=24)
+                make_mp4(bwd_src, output_path=f"visuals/{vid_name}/{config}/backward.mp4", base_name="pred_frame", fps=24)
             else:
                 src_dir = f"visuals/{vid_name}/{config}/{v}/preds"
-                out_path = f"visuals/{vid_name}/{config}/{v}/preds.mp4"
+                out_path = f"visuals/{vid_name}/{config}/{v}.mp4"
                 make_mp4(src_dir, output_path=out_path, base_name="pred_frame", fps=24)
         except Exception as e:
             print(f"Failed to create mp4 for {v}: {e}")
@@ -299,7 +299,7 @@ def explain(vid, device):
 
 if __name__ == "__main__":
     device = "cuda:1"
-    name = "beauty"
+    name = "bosphorus"
     config = "small"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True

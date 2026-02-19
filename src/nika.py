@@ -118,7 +118,26 @@ class TuckerFactor(nn.Module):
 
     def get(self, target):
         U = self.forward()
-        return U[target]
+        target = torch.as_tensor(target, device=U.device, dtype=torch.float32)
+        if target.dim() == 0:
+            target = target[None]
+
+        denom = max(self.target_dim - 1, 1)
+        t_norm = 2.0 * (target / denom) - 1.0  # [-1, 1]
+        t_norm = t_norm.view(1, -1, 1, 1)
+
+        grid = torch.zeros((1, t_norm.shape[1], 1, 2), device=U.device, dtype=t_norm.dtype)
+        grid[..., 1] = t_norm.squeeze(-1)  # y coord (H)
+        # x coord (W=1) stays 0
+
+        def _sample(inp):
+            inp_ = inp.transpose(0, 1).unsqueeze(0).unsqueeze(-1)  # [1, R, T, 1]
+            out = F.grid_sample(inp_, grid, mode="bilinear", align_corners=True, padding_mode="border")
+            return out.squeeze(0).squeeze(-1).transpose(0, 1)  # [B, R]
+
+        if torch.is_complex(U):
+            return torch.complex(_sample(U.real), _sample(U.imag))
+        return _sample(U)
 
 
 class RealTucker(nn.Module):
@@ -470,36 +489,77 @@ class BasicUpres(nn.Module):
 
 
 class ConvOperator(nn.Module):
-    def __init__(self, in_channels, out_channels, h_dim, device='cuda'):
+    def __init__(self, in_channels, out_channels, h_dim, encoding_len=128, device='cuda'):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.device = device
 
-        self.operator = nn.Sequential(
+        self.operator_head = nn.Sequential(
             nn.Conv2d(in_channels, h_dim, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(h_dim, h_dim, kernel_size=3, padding=1, groups=h_dim),
             nn.GELU(),
             nn.Conv2d(h_dim, h_dim, kernel_size=1),
-            nn.GELU(),
+        ).to(device)
+
+        self.operator_tail = nn.Sequential(
             nn.Conv2d(h_dim, h_dim, kernel_size=3, padding=1, groups=h_dim),
             nn.GELU(),
             nn.Conv2d(h_dim, out_channels, kernel_size=1),
         ).to(device)
 
-        nn.init.zeros_(self.operator[-1].weight)
-        nn.init.zeros_(self.operator[-1].bias)
+        self.encoding = FourierEncoding(
+            target_dim=encoding_len,
+            max_freq=64,
+            device=device
+        )
 
-    def forward(self, x):
+        self.t_modulator = nn.Sequential(
+            nn.Linear(encoding_len, h_dim),
+            nn.GELU(),
+            nn.Linear(h_dim, 2 * h_dim),
+        ).to(device)
+
+        nn.init.zeros_(self.operator_tail[-1].weight)
+        nn.init.zeros_(self.operator_tail[-1].bias)
+        nn.init.zeros_(self.t_modulator[-1].weight)
+        nn.init.zeros_(self.t_modulator[-1].bias)
+
+    def forward(self, x, t):
         if x.all() == 0:
             return torch.zeros(
                 (x.shape[0], self.out_channels, x.shape[2], x.shape[3]),
                 device=self.device,
                 dtype=x.dtype,
             )
-        conv_x = self.operator(x)
+        initial = self.operator_head(x)
+        time_emb = self.encoding(t)
+        modulation = self.t_modulator(time_emb)
+        gamma, beta = modulation.chunk(2, dim=-1)
+        gamma = gamma.view(-1, self.operator_head[-1].out_channels, 1, 1)
+        beta = beta.view(-1, self.operator_head[-1].out_channels, 1, 1)
+        modulated = initial * (1 + gamma) + beta
+        conv_x = self.operator_tail(modulated)
         return conv_x
+
+
+class RKOperator(nn.Module):
+    def __init__(self, operator, *feature_grids, step_size=1, device='cuda'):
+        super().__init__()
+        self.operator = operator
+        self.feature_grids = feature_grids
+        self.step_size = step_size
+        self.device = device
+
+    def forward(self, x):
+        k1 = torch.cat([grid(x) for grid in self.feature_grids], dim=1)
+
+        k1 = self.operator(x)
+        k2 = self.operator(x + 0.5 * k1)
+        k3 = self.operator(x + 0.5 * k2)
+        k4 = self.operator(x + k3)
+        return (k1 + 2 * k2 + 2 * k3 + k4) / 6
 
 
 class NikaBlock(nn.Module):
@@ -579,7 +639,8 @@ class NikaBlock(nn.Module):
     def forward(self, t, noise_op=None, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, return_operators=False):
         if type(t) is not torch.Tensor:
             t = torch.tensor([t], device=self.grid_features.grid.device, dtype=torch.int64)
-        grid_out = self.grid_features(t / (self.T - 1))
+        norm_t = t / (self.T - 1)
+        grid_out = self.grid_features(norm_t)
         real_tucker_out = self.real_tucker(t)
         complex_tucker_out = self.complex_tucker(t)
         if zero_real_tucker:
@@ -595,9 +656,11 @@ class NikaBlock(nn.Module):
         next_frames = torch.zeros_like(base_input)
 
         mask_prev = (t > 0)
+
         if mask_prev.any():
             t_prev = (t[mask_prev] - 1)
-            grid_prev = self.grid_features(t_prev / (self.T - 1))
+            norm_t_prev = t_prev / (self.T - 1)
+            grid_prev = self.grid_features(norm_t_prev)
             real_prev = self.real_tucker(t_prev)
             complex_prev = self.complex_tucker(t_prev)
             if zero_real_tucker:
@@ -609,12 +672,13 @@ class NikaBlock(nn.Module):
             base_prev = torch.cat([grid_prev, real_prev, complex_prev], dim=1)
             base_prev = self.groupnorm(base_prev)
             prev_frames[mask_prev] = base_prev
-        forward_prediction = self.forward_operator(prev_frames)
+        forward_prediction = self.forward_operator(prev_frames, norm_t_prev)
 
         mask_next = (t < (self.T - 1))
         if mask_next.any():
             t_next = (t[mask_next] + 1)
-            grid_next = self.grid_features(t_next / (self.T - 1))
+            norm_t_next = t_next / (self.T - 1)
+            grid_next = self.grid_features(norm_t_next)
             real_next = self.real_tucker(t_next)
             complex_next = self.complex_tucker(t_next)
             if zero_real_tucker:
@@ -626,7 +690,7 @@ class NikaBlock(nn.Module):
             base_next = torch.cat([grid_next, real_next, complex_next], dim=1)
             base_next = self.groupnorm(base_next)
             next_frames[mask_next] = base_next
-        backward_prediction = self.backward_operator(next_frames)
+        backward_prediction = self.backward_operator(next_frames, norm_t_next)
 
         aggregated = base_input + forward_prediction + backward_prediction
 
@@ -685,7 +749,8 @@ def feature_test(vid, name, config, device):
             max_t = min((t + 1) * batch_size, vid.shape[0])
             batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
             t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
-            prediction = model(t_batch, noise_op=noise_op)
+            # prediction = model(t_batch, noise_op=noise_op)
+            prediction = model(t_batch)
             mse = F.mse_loss(prediction, batch_gt)
             psnr = -10.0 * torch.log10(mse + 1e-8)
             frame_loss = (-psnr).mean() / num_batches
@@ -713,8 +778,8 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:1"
-    name = "beauty"
+    device = "cuda:0"
+    name = "shake"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
