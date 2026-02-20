@@ -544,21 +544,19 @@ class ConvOperator(nn.Module):
         return conv_x
 
 
-class RKOperator(nn.Module):
-    def __init__(self, operator, *feature_grids, step_size=1, device='cuda'):
+class RK4Operator(nn.Module):
+    def __init__(self, operator, dt=1, device='cuda'):
         super().__init__()
         self.operator = operator
-        self.feature_grids = feature_grids
-        self.step_size = step_size
+        self.dt = dt
         self.device = device
 
-    def forward(self, x):
-        k1 = torch.cat([grid(x) for grid in self.feature_grids], dim=1)
-
-        k1 = self.operator(x)
-        k2 = self.operator(x + 0.5 * k1)
-        k3 = self.operator(x + 0.5 * k2)
-        k4 = self.operator(x + k3)
+    def forward(self, yn, t):
+        k1 = self.operator(yn, t)
+        half_step = t + (0.5 * self.dt)
+        k2 = self.operator(yn + 0.5 * k1 * self.dt, half_step)
+        k3 = self.operator(yn + 0.5 * k2 * self.dt, half_step)
+        k4 = self.operator(yn + k3 * self.dt, t + self.dt)
         return (k1 + 2 * k2 + 2 * k3 + k4) / 6
 
 
@@ -673,6 +671,7 @@ class NikaBlock(nn.Module):
             base_prev = self.groupnorm(base_prev)
             prev_frames[mask_prev] = base_prev
         forward_prediction = self.forward_operator(prev_frames, norm_t_prev)
+        # forward_prediction = self.rk4_forward(prev_frames, t[mask_prev])
 
         mask_next = (t < (self.T - 1))
         if mask_next.any():
@@ -691,6 +690,7 @@ class NikaBlock(nn.Module):
             base_next = self.groupnorm(base_next)
             next_frames[mask_next] = base_next
         backward_prediction = self.backward_operator(next_frames, norm_t_next)
+        # backward_prediction = self.rk4_backward(next_frames, t[mask_next])
 
         aggregated = base_input + forward_prediction + backward_prediction
 
@@ -779,7 +779,7 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:0"
-    name = "shake"
+    name = "honey"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
