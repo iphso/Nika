@@ -271,34 +271,53 @@ def tucker_construct(UT, UC, UH, UW, G):
 
 
 class BasicUpres(nn.Module):
-    def __init__(self, in_channels, out_channels, hidden, k, device='cuda'):
+    def __init__(self, in_channels, out_channels, hidden, k, encoding_len=64, device='cuda'):
         super().__init__()
         half_k = k // 2
         self.k = k
 
-        base_hdim = hidden
-        self.layers = nn.ModuleList([
-            nn.Conv2d(in_channels, base_hdim, 1),
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(base_hdim, base_hdim, 3, padding=1, groups=base_hdim),
-            nn.GELU(),
-            nn.Conv2d(base_hdim, base_hdim, 1),
-            nn.GELU(),
-            nn.Conv2d(base_hdim, out_channels * (k ** 2), kernel_size=1),
-            nn.PixelShuffle(upscale_factor=k),
-        ])
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden),
+        ).to(device)
 
-        self.upres = nn.Sequential(*self.layers).to(device)
+        self.encoding = FourierEncoding(
+            target_dim=encoding_len,
+            max_freq=64,
+            freq_init="log",
+            device=device
+        )
+
+        self.film_modulator = nn.Sequential(
+            nn.Linear(encoding_len, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 2 * hidden),
+        ).to(device)
+        nn.init.zeros_(self.film_modulator[-1].weight)
+        nn.init.zeros_(self.film_modulator[-1].bias)
+
+        self.tail = nn.Sequential(
+            nn.Conv2d(hidden, out_channels * (k ** 2), kernel_size=1),
+            nn.PixelShuffle(upscale_factor=k),
+        ).to(device)
 
         #kaiming init
-        for m in self.upres.modules():
+        for m in self.tail.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x):
-        base = self.upres(x)
+    def forward(self, x, t):
+        base = self.head(x)
+        encoding = self.encoding(t)
+        modulation = self.film_modulator(encoding)
+        gamma, beta = modulation.chunk(2, dim=-1)
+        gamma = gamma.view(-1, base.shape[1], 1, 1)
+        beta = beta.view(-1, base.shape[1], 1, 1)
+        base = base * (1 + gamma) + beta
+        base = self.tail(base)
         return base
 
 
@@ -326,6 +345,7 @@ class ConvOperator(nn.Module):
         self.encoding = FourierEncoding(
             target_dim=encoding_len,
             max_freq=64,
+            freq_init="log",
             device=device
         )
 
@@ -412,7 +432,7 @@ class NikaBlock(nn.Module):
             k=k,    
             device=device,
         )
-        self.upres = torch.compile(self.upres)
+        # self.upres = torch.compile(self.upres)
 
         self.log_stats()
 
@@ -490,12 +510,10 @@ class NikaBlock(nn.Module):
 
         aggregated = base_input + forward_prediction + backward_prediction
 
-        if noise_op is not None:
-            aggregated = noise_op(aggregated)
-        refined = self.upres(aggregated)
+        refined = self.upres(aggregated, t)
         if return_operators:
-            refined_forward = self.upres(forward_prediction)
-            refined_backward = self.upres(backward_prediction)
+            refined_forward = self.upres(forward_prediction, t)
+            refined_backward = self.upres(backward_prediction, t)
             return refined, refined_forward, refined_backward
         return refined
 
@@ -507,7 +525,7 @@ class NikaBlock(nn.Module):
             rand_vals = torch.linspace(0, self.T - 1, steps=10, dtype=torch.int64, device=self.grid_features.grid.device)
             torch.cuda.synchronize()
             start_time = time.time()
-            imgs = self.forward(rand_vals)
+            imgs = self.forward(rand_vals, rand_vals)
             torch.cuda.synchronize()
             average_frame_time = (time.time() - start_time) / rand_vals.shape[0]
             print(f"Average inference time per frame: {average_frame_time:.5f}s")
@@ -571,7 +589,7 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:1"
+    device = "cuda:0"
     name = "shake"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)

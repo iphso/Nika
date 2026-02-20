@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 
@@ -36,6 +38,8 @@ class FourierEncoding(nn.Module):
         adj_max_freq = max_freq * 2 * torch.pi
         if freq_init == "uniform":
             self.freqs = nn.Parameter(torch.rand(freq_dim, device=device) * adj_max_freq, requires_grad=learnable_freqs)
+        elif freq_init == "log":
+            self.freqs = nn.Parameter(torch.exp(torch.rand(freq_dim, device=device) * math.log(adj_max_freq)), requires_grad=learnable_freqs)
         else:
             raise ValueError(f"Unsupported freq_init: {freq_init}")
         self.include_raw = include_raw
