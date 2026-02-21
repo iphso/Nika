@@ -410,7 +410,7 @@ class NikaBlock(nn.Module):
             k=k,    
             device=device,
         )
-        # self.upres = torch.compile(self.upres)
+        self.upres = torch.compile(self.upres)
 
         self.log_stats()
 
@@ -568,9 +568,9 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:0"
-    name = "beauty"
+    name = "bunny"
     torch.manual_seed(42)
-    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    vid = load_video_frames(f"static/benchmarks/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
