@@ -276,48 +276,26 @@ class BasicUpres(nn.Module):
         half_k = k // 2
         self.k = k
 
-        self.head = nn.Sequential(
+        self.upres = nn.Sequential(
             nn.Conv2d(in_channels, hidden, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden),
-        ).to(device)
-
-        self.encoding = FourierEncoding(
-            target_dim=encoding_len,
-            max_freq=64,
-            freq_init="log",
-            device=device
-        )
-
-        self.film_modulator = nn.Sequential(
-            nn.Linear(encoding_len, hidden),
             nn.GELU(),
-            nn.Linear(hidden, 2 * hidden),
-        ).to(device)
-        nn.init.zeros_(self.film_modulator[-1].weight)
-        nn.init.zeros_(self.film_modulator[-1].bias)
-
-        self.tail = nn.Sequential(
+            nn.Conv2d(hidden, hidden, kernel_size=1),
+            nn.GELU(),
             nn.Conv2d(hidden, out_channels * (k ** 2), kernel_size=1),
             nn.PixelShuffle(upscale_factor=k),
         ).to(device)
 
         #kaiming init
-        for m in self.tail.modules():
+        for m in self.upres.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
     def forward(self, x, t):
-        base = self.head(x)
-        encoding = self.encoding(t)
-        modulation = self.film_modulator(encoding)
-        gamma, beta = modulation.chunk(2, dim=-1)
-        gamma = gamma.view(-1, base.shape[1], 1, 1)
-        beta = beta.view(-1, base.shape[1], 1, 1)
-        base = base * (1 + gamma) + beta
-        base = self.tail(base)
+        base = self.upres(x)
         return base
 
 
@@ -590,7 +568,7 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:0"
-    name = "shake"
+    name = "beauty"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
