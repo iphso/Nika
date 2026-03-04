@@ -21,27 +21,6 @@ from encoding_utils import FourierEncoding
 from configs import REFERENCES
 
 
-def hermitian_project_shifted(Ks):
-    B, C, kh, kw = Ks.shape
-    Ku = torch.fft.ifftshift(Ks, dim=(-2, -1))
-    # Partner mapping in UNshifted coords is i → (-i mod k), which equals flip + roll(+1)
-    partner = torch.roll(
-        torch.roll(torch.flip(Ku, dims=(-2, -1)), shifts=1, dims=-2),
-        shifts=1, dims=-1
-    ).conj()
-
-    Ksym = 0.5 * (Ku + partner)
-
-    # Force self-conjugate bins to be real
-    Ksym[..., 0, 0] = Ksym[..., 0, 0].real + 0j
-    if kw % 2 == 0:
-        mid = kw // 2
-        Ksym[..., 0,  mid] = Ksym[..., 0,  mid].real + 0j
-        Ksym[..., mid, 0 ] = Ksym[..., mid, 0 ].real + 0j
-        Ksym[..., mid, mid] = Ksym[..., mid, mid].real + 0j
-    return torch.fft.fftshift(Ksym, dim=(-2, -1))  # back to SHIFTED
-
-
 class TuckerFactor(nn.Module):
     def __init__(self, target_dim, rank, is_complex=False, base_mag=1e-2, device='cuda'):
         """
@@ -178,8 +157,21 @@ class ComplexTucker(RealTucker):
         UT = self.UT.get(t)
         G = torch.complex(self.G_real, self.G_imag)
         construct = tucker_construct(UT, UC, UH, UW, G)
-        base = hermitian_project_shifted(construct)
-        real_tucker = torch.fft.ifft2(base, norm='ortho').real
+        target_w = (construct.shape[-1] + 1) // 2
+        real = F.interpolate(
+            construct.real,
+            size=(construct.shape[-2], target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        imag = F.interpolate(
+            construct.imag,
+            size=(construct.shape[-2], target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        hplane_sample = torch.complex(real, imag)
+        real_tucker = torch.fft.irfft2(hplane_sample, s=(self.H, self.W), norm='ortho')
         return real_tucker.contiguous()
 
 
@@ -191,7 +183,7 @@ def padded_size(H: int, P: int, S: int) -> int:
 
 
 class GaborTucker(nn.Module):
-    def __init__(self, target_size, patch_size=16, time_ranks=8, spatial_ranks=4, device='cuda'):
+    def __init__(self, target_size, patch_size=16, time_ranks=8, spatial_ranks=8, spatial_bank=128, device='cuda'):
         super().__init__()
         self.C, self.H, self.W, self.T = target_size
         self.P = patch_size
@@ -205,9 +197,11 @@ class GaborTucker(nn.Module):
         self.n_patches_w = (self.Wpad - self.P) // self.stride + 1
         self.n_patches = self.n_patches_h * self.n_patches_w
 
-        self.h_bank = nn.Parameter(torch.randn(self.C, spatial_ranks, self.P, device=device) * 1e-2)
-        self.w_bank = nn.Parameter(torch.randn(self.C, spatial_ranks, self.P, device=device) * 1e-2)
+        self.h_bank = nn.Parameter(torch.randn(self.C, spatial_bank, self.P, device=device) * 1e-2)
+        self.w_bank = nn.Parameter(torch.randn(self.C, spatial_bank, self.P // 2, device=device) * 1e-2)
         self.patch_coeffs = nn.Parameter(torch.randn(self.n_patches, 2, spatial_ranks, time_ranks, device=device) * 1e-2)
+
+        self.rank_to_bank = nn.Linear(spatial_ranks, spatial_bank, bias=False).to(device)
 
         w = torch.hann_window(self.P, periodic=False, device=device)
         self.hann_window_2d = torch.outer(w, w)
@@ -226,12 +220,14 @@ class GaborTucker(nn.Module):
         B, rT = t_emb.shape
         
         coeff_reim = torch.einsum("pnrt, bt -> bpnr", self.patch_coeffs, t_emb)
+        coeff_reim = self.rank_to_bank(coeff_reim)
+        coeff_reim = F.softmax(coeff_reim, dim=-1)
         coeff = torch.complex(coeff_reim[:, :, 0, :], coeff_reim[:, :, 1, :])
         atoms = torch.einsum("crp,crq->crpq", self.h_bank, self.w_bank)
         atoms_c = torch.complex(atoms, torch.zeros_like(atoms))
         spec = torch.einsum("crpq,bnr->bcnpq", atoms_c, coeff)
 
-        patches = torch.fft.ifft2(spec, dim=(-2, -1), norm='ortho').real
+        patches = torch.fft.irfft2(spec, s=(self.P, self.P), norm='ortho')
         windowed_patches = torch.einsum("bcnpq,pq->bcnpq", patches, self.hann_window_2d)
         permuted_patches = windowed_patches.permute(0, 1, 3, 4, 2)  # [B, C, P, P, N]
         unfolded_patches = permuted_patches.contiguous().view(B, self.C * self.P * self.P, self.n_patches)
@@ -451,7 +447,7 @@ class NikaBlock(nn.Module):
             spatial_ranks=16,
             device=device,
         )
-        self.gabor_tucker = torch.compile(self.gabor_tucker)
+        # self.gabor_tucker = torch.compile(self.gabor_tucker)
 
         self.groupnorm = nn.GroupNorm(num_groups=4, num_channels=4 * self.C).to(device)
         self.groupnorm = torch.compile(self.groupnorm)
@@ -652,7 +648,7 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:0"
+    device = "cuda:1"
     name = "bunny"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
