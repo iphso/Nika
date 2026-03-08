@@ -392,7 +392,7 @@ class NikaBlock(nn.Module):
             self.backward_operators.append(torch.compile(bwd))
 
         self.upres = BasicUpres(
-            in_channels = (self.n_heads + 1) * self.C,
+            in_channels = self.n_heads * self.C,
             out_channels = out_channels,
             hidden = conv_hidden,
             k = k,    
@@ -563,9 +563,9 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:0"
-    name = "bunny"
+    name = "yacht"
     torch.manual_seed(42)
-    vid = load_video_frames(f"static/benchmarks/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
