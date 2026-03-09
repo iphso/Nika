@@ -569,4 +569,4 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    feature_test(vid, name, f"scratch", device=device)
+    feature_test(vid, name, f"medium", device=device)
