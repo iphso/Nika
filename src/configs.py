@@ -27,6 +27,6 @@ REFERENCES = {
         "grid_ranks": [16, 270, 480, 1],
         "real_tucker_ranks": [4, 100, 100, 100],
         "complex_tucker_ranks": [4, 95, 95, 80],
-        "conv_hidden": 48,
+        "conv_hidden": 84,
     },
 }

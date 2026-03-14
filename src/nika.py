@@ -518,7 +518,17 @@ def feature_test(vid, name, config, device):
         device=device,
     )
 
-    opt = SOAP(list(model.parameters()), lr=1e-2)
+    # create optimizer with two parameter groups:
+    #  - basis_params: the two tuckers + the feature grid (we'll decay their lr)
+    #  - rest_params: all remaining parameters (keep their lr constant)
+    base_lr = 1e-2
+    basis_params = list(model.real_tucker.parameters()) + list(model.complex_tucker.parameters()) + list(model.grid_features.parameters())
+    basis_ids = set(map(id, basis_params))
+    rest_params = [p for p in model.parameters() if id(p) not in basis_ids]
+    opt = SOAP([
+        {"params": basis_params, "lr": base_lr},
+        {"params": rest_params, "lr": base_lr},
+    ], lr=base_lr)
 
     best_psnr = float('-inf')
     best_epoch = -1
@@ -544,6 +554,20 @@ def feature_test(vid, name, config, device):
         epoch_psnr = -loss.item()
         print(f"Epoch {epoch} loss: {loss.item():.4f}, time: {average_frame_time:.5f}s, PSNR: {epoch_psnr:.2f}")
 
+        # schedule: linearly anneal basis lr from base_lr -> 0 over epochs [500, 1500]
+        if epoch < 500:
+            new_basis_lr = base_lr
+        elif epoch <= 1500:
+            frac = (epoch - 500) / float(1500 - 500)
+            new_basis_lr = base_lr * (1.0 - frac)
+        else:
+            new_basis_lr = 0.0
+        # our first param_group is the basis group
+        try:
+            opt.param_groups[0]["lr"] = new_basis_lr
+        except Exception:
+            pass
+
         if epoch_psnr > best_psnr and (epoch - best_epoch >= 10 or best_epoch == -1):
             best_psnr = epoch_psnr
             best_epoch = epoch
@@ -563,10 +587,10 @@ def feature_test(vid, name, config, device):
 
 if __name__ == "__main__":
     device = "cuda:0"
-    name = "yacht"
+    name = "shake"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    feature_test(vid, name, f"medium", device=device)
+    feature_test(vid, name, f"large", device=device)
