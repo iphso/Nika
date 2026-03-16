@@ -442,12 +442,15 @@ class NikaBlock(nn.Module):
             step_len = (i + 1) * self.dT
             mask_prev = (norm_t >= step_len)
             norm_t_prev = (norm_t[mask_prev] - step_len) if mask_prev.any() else None
+            prev_zero_base = zero_base[mask_prev]
+
             mask_next = (norm_t <= (1 - step_len))
             norm_t_next = (norm_t[mask_next] + step_len) if mask_next.any() else None
+            next_zero_base = zero_base[mask_next]
 
-            prev_real_tucker, next_real_tucker = zero_base, zero_base
-            prev_complex_tucker, next_complex_tucker = zero_base, zero_base
-            prev_grid, next_grid = zero_base, zero_base
+            prev_real_tucker, next_real_tucker = prev_zero_base, next_zero_base
+            prev_complex_tucker, next_complex_tucker = prev_zero_base, next_zero_base
+            prev_grid, next_grid = prev_zero_base, next_zero_base
 
             if not zero_real_tucker:
                 prev_real_tucker = self.real_tucker(norm_t_prev) if mask_prev.any() else zero_base
@@ -463,18 +466,20 @@ class NikaBlock(nn.Module):
 
             prev_base = torch.cat([prev_grid, prev_real_tucker, prev_complex_tucker], dim=1)
             prev_base = self.groupnorm(prev_base)
-
             prev_frames = torch.zeros_like(current_input)
-            prev_frames[mask_prev] = prev_base
+            if mask_prev.any():
+                prev_frames[mask_prev] = prev_base
+
             forward_operator = self.forward_operators[i]
             if mask_prev.any():
                 forward_prediction = forward_operator(torch.cat([prev_frames, current_input], dim=1), norm_t_prev)
                 operator_residual += forward_prediction
 
-            next_base = torch.cat([next_grid, next_real_tucker, next_complex_tucker], dim=1)
-            next_base = self.groupnorm(next_base)
             next_frames = torch.zeros_like(current_input)
-            next_frames[mask_next] = next_base
+            if mask_next.any():
+                next_base = torch.cat([next_grid, next_real_tucker, next_complex_tucker], dim=1)
+                next_base = self.groupnorm(next_base)
+                next_frames[mask_next] = next_base
             backward_operator = self.backward_operators[i]
             if mask_next.any():
                 backward_prediction = backward_operator(torch.cat([current_input, next_frames], dim=1), norm_t_next)
@@ -518,17 +523,59 @@ def feature_test(vid, name, config, device):
         device=device,
     )
 
-    # create optimizer with two parameter groups:
-    #  - basis_params: the two tuckers + the feature grid (we'll decay their lr)
-    #  - rest_params: all remaining parameters (keep their lr constant)
     base_lr = 1e-2
-    basis_params = list(model.real_tucker.parameters()) + list(model.complex_tucker.parameters()) + list(model.grid_features.parameters())
-    basis_ids = set(map(id, basis_params))
-    rest_params = [p for p in model.parameters() if id(p) not in basis_ids]
-    opt = SOAP([
-        {"params": basis_params, "lr": base_lr},
-        {"params": rest_params, "lr": base_lr},
-    ], lr=base_lr)
+    # single optimizer for all parameters (everything moves together)
+    opt = SOAP(model.parameters(), lr=base_lr, weight_decay=0)
+
+    # Tapered warm restarts: CosineAnnealingWarmRestarts combined with
+    # a global linear taper multiplier so restart amplitudes shrink
+    # over the course of training (prevents large unrecoverable spikes).
+    class TaperedWarmRestarts:
+        def __init__(self, optimizer, T_0=200, T_mult=2, eta_min=0.0, max_epochs=2000, final_multiplier=0.2):
+            self.optimizer = optimizer
+            self.base_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
+            )
+            self.max_epochs = max_epochs
+            self.final_multiplier = float(final_multiplier)
+            # store original base lrs to compute taper relative to initial scale
+            self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+            self.last_epoch = -1
+
+        def step(self, epoch=None):
+            # advance epoch counter
+            if epoch is None:
+                self.last_epoch += 1
+                epoch = self.last_epoch
+            else:
+                self.last_epoch = int(epoch)
+
+            # step the underlying cosine-with-restarts scheduler
+            self.base_scheduler.step(epoch)
+
+            # compute a linear taper from 1.0 -> final_multiplier over max_epochs
+            taper = 1.0 - (float(self.last_epoch) / float(self.max_epochs)) * (1.0 - self.final_multiplier)
+            if taper < self.final_multiplier:
+                taper = self.final_multiplier
+
+            # the base_scheduler already updated optimizer.param_groups' lr values
+            # relative to the stored base_lrs; compute cosine scale and reapply with taper
+            for i, group in enumerate(self.optimizer.param_groups):
+                base = float(self.base_lrs[i])
+                # avoid division by zero
+                cos_lr = float(group['lr'])
+                cos_scale = (cos_lr / base) if base > 0.0 else 1.0
+                group['lr'] = base * cos_scale * taper
+
+    # instantiate tapered scheduler
+    scheduler = TaperedWarmRestarts(
+        opt,
+        T_0=200,
+        T_mult=2,
+        eta_min=base_lr * 0.1,
+        max_epochs=2000,
+        final_multiplier=0.2,
+    )
 
     best_psnr = float('-inf')
     best_epoch = -1
@@ -550,23 +597,11 @@ def feature_test(vid, name, config, device):
             frame_loss = (-psnr).mean() / num_batches
             frame_loss.backward()
             loss += frame_loss
+        opt.step()
+        scheduler.step()
         average_frame_time = (time.time() - start_time) / vid.shape[0]
         epoch_psnr = -loss.item()
         print(f"Epoch {epoch} loss: {loss.item():.4f}, time: {average_frame_time:.5f}s, PSNR: {epoch_psnr:.2f}")
-
-        # schedule: linearly anneal basis lr from base_lr -> 0 over epochs [500, 1500]
-        if epoch < 500:
-            new_basis_lr = base_lr
-        elif epoch <= 1500:
-            frac = (epoch - 500) / float(1500 - 500)
-            new_basis_lr = base_lr * (1.0 - frac)
-        else:
-            new_basis_lr = 0.0
-        # our first param_group is the basis group
-        try:
-            opt.param_groups[0]["lr"] = new_basis_lr
-        except Exception:
-            pass
 
         if epoch_psnr > best_psnr and (epoch - best_epoch >= 10 or best_epoch == -1):
             best_psnr = epoch_psnr
@@ -576,8 +611,6 @@ def feature_test(vid, name, config, device):
             os.sync()
             print(f"New best model saved at epoch {epoch} with PSNR: {best_psnr:.2f}")
 
-        opt.step()
-
         if epoch % 25 == 0:
             print(f"Epoch {epoch}: Tucker PSNR: {epoch_psnr:.2f}")
             model.test_images("out_feature_test")
@@ -586,7 +619,7 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:0"
+    device = "cuda:1"
     name = "shake"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)

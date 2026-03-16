@@ -43,7 +43,7 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
 
 def benchmark_psnr(basedir, vid_name, config, device):
     vid = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
-    model = get_best_model("models/ref_models", vid.shape, vid_name, config, device)
+    model = get_best_model("models/ref_models/d35975e/{config}", vid.shape, vid_name, config, device)
 
     core_image = model.grid_features.grid.data.cpu().numpy().copy()
     print(f"Core image shape: {core_image.shape}, value range: [{core_image.min()}, {core_image.max()}]")
@@ -149,7 +149,7 @@ def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None,
     probe_shape = probe.shape  # (T_probe, C, H, W)
     # Use the provided `n_frames` for temporal length, but match spatial/channel dims from probe
     vid_shape = [n_frames, probe_shape[1], probe_shape[2], probe_shape[3]]
-    model = get_best_model("models/ref_models", vid_shape, vid_name, config, device)
+    model = get_best_model(f"models/ref_models/d35975e/{config}", vid_shape, vid_name, config, device)
     model.eval()
 
     num_frames = int(n_frames)
@@ -165,28 +165,30 @@ def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None,
 
     with torch.no_grad():
         for batch_idx in range(num_batches):
+            print(f"Processing batch {batch_idx + 1}/{num_batches} for variants: {variants}")
             min_t = batch_idx * batch_size
             max_t = min((batch_idx + 1) * batch_size, num_frames)
             t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
+            norm_t_batch = t_batch.float() / (num_frames - 1)  # normalize time for operators that use it
 
             # baseline call
             if 'baseline' in variants:
-                out_base = model(t_batch)
+                out_base = model(norm_t_batch)
 
             # zeroed variants use forward flags
             if 'only_grid' in variants:
-                out_no_tucker = model(t_batch, zero_real_tucker=True, zero_complex_tucker=True)
+                out_no_tucker = model(norm_t_batch, zero_real_tucker=True, zero_complex_tucker=True)
             if 'only_realt' in variants:
-                out_zero_real = model(t_batch, zero_complex_tucker=True, zero_feature_grid=True)
+                out_zero_real = model(norm_t_batch, zero_complex_tucker=True, zero_feature_grid=True)
             if 'only_complext' in variants:
-                out_zero_complex = model(t_batch, zero_real_tucker=True, zero_feature_grid=True)
+                out_zero_complex = model(norm_t_batch, zero_real_tucker=True, zero_feature_grid=True)
             if 'gridless' in variants:
-                out_backless = model(t_batch, zero_feature_grid=True)
+                out_backless = model(norm_t_batch, zero_feature_grid=True)
 
             # forward/backward operators passed through upres
             if 'forward_backward_upres' in variants:
                 # model.forward(..., return_operators=True) -> (refined, refined_forward, refined_backward)
-                _, refined_forward, refined_backward = model(t_batch, return_operators=True)
+                _, refined_forward, refined_backward = model(norm_t_batch, return_operators=True)
                 out_forward = refined_forward
                 out_backward = refined_backward
 
@@ -299,7 +301,7 @@ def explain(vid, device):
 
 if __name__ == "__main__":
     device = "cuda:1"
-    name = "bosphorus"
+    name = "beauty"
     config = "small"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
