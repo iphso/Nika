@@ -141,9 +141,9 @@ class ComplexTucker(RealTucker):
 
     def __init__(self, target_shape, ranks, device='cuda'):
         super().__init__(target_shape, ranks, device=device)
-        half_W = (self.W // 2) + 1
+        self.half_W = (self.W // 2) + 1
         self.UH = TuckerFactor(self.H, self.rH, is_complex=True, device=device)
-        self.UW = TuckerFactor(half_W, self.rW, is_complex=True, device=device)
+        self.UW = TuckerFactor(self.half_W, self.rW, is_complex=True, device=device)
         self.UC = TuckerFactor(self.C, self.rC, is_complex=True, device=device)
         self.UT = TuckerFactor(self.T, self.rT, is_complex=True, device=device)
 
@@ -151,19 +151,25 @@ class ComplexTucker(RealTucker):
         self.G_real = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
         self.G_imag = nn.Parameter(torch.zeros(self.rT, self.rC, self.rH, self.rW, device=device))
 
-        self.feature_grid = FeatureGrid([self.C * 2, self.H, half_W, self.T], grid_res=[self.C * 2, self.H, half_W, 1], device=device)
+        self.feature_grid = FeatureGrid([self.C * 2, self.H, self.half_W, self.T], grid_res=[self.C * 2, self.H, self.half_W, 1], device=device)
 
-    def forward(self, t):
-        UH = self.UH()
-        UW = self.UW()
-        UC = self.UC()
-        UT = self.UT.get(t)
-        G = torch.complex(self.G_real, self.G_imag)
-        construct = tucker_construct(UT, UC, UH, UW, G)
+    def forward(self, t, zero_complex_tucker=False, zero_complex_grid=False):
+        construct = torch.zeros((t.shape[0], self.C, self.H, self.half_W), device=t.device, dtype=torch.complex64)
+        if not zero_complex_tucker:
+            UH = self.UH()
+            UW = self.UW()
+            UC = self.UC()
+            UT = self.UT.get(t)
+            G = torch.complex(self.G_real, self.G_imag)
+            construct = tucker_construct(UT, UC, UH, UW, G)
 
-        grid = self.feature_grid(t)
-        complex_grid = torch.complex(*grid.chunk(2, dim=1))
-        construct = construct * complex_grid
+        if not zero_complex_grid:
+            grid = self.feature_grid(t)
+            complex_grid = torch.complex(*grid.chunk(2, dim=1))
+            if zero_complex_tucker:
+                 construct = complex_grid
+            else:
+                construct = construct * complex_grid
         real_tucker = torch.fft.irfft2(construct, norm='ortho').real
         return real_tucker.contiguous()
 
@@ -418,7 +424,7 @@ class NikaBlock(nn.Module):
         print(f"  Upsampling CNN:  {upres_params / 1e6:.3f}M")
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
-    def forward(self, norm_t, noise_op=None, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, return_operators=False):
+    def forward(self, norm_t, noise_op=None, zero_real_tucker=False, zero_complex_tucker=False, zero_feature_grid=False, zero_complex_grid=False, return_operators=False):
         if type(norm_t) is not torch.Tensor:
             norm_t = torch.tensor([norm_t], device=self.grid_features.grid.device, dtype=torch.float32)
 
@@ -432,12 +438,14 @@ class NikaBlock(nn.Module):
         zero_base = self._zero_base.expand(norm_t.shape[0], -1, -1, -1)
         curr_real_tucker = self.real_tucker(norm_t) if not zero_real_tucker else zero_base
         curr_real_grid = self.grid_features(norm_t) if not zero_feature_grid else zero_base
-        curr_complex_tucker = self.complex_tucker(norm_t) if not zero_complex_tucker else zero_base
+        curr_complex_tucker = self.complex_tucker(norm_t, zero_complex_tucker, zero_complex_grid)
 
         current_base = torch.cat([curr_real_grid, curr_real_tucker, curr_complex_tucker], dim=1)
         current_input = self.groupnorm(current_base)
 
         operator_residual = torch.zeros_like(current_input)
+        if return_operators:
+            operator_steps = []
         for i in range(self.operator_steps):
             step_len = (i + 1) * self.dT
             mask_prev = (norm_t >= step_len)
@@ -474,6 +482,8 @@ class NikaBlock(nn.Module):
             if mask_prev.any():
                 forward_prediction = forward_operator(torch.cat([prev_frames, current_input], dim=1), norm_t_prev)
                 operator_residual += forward_prediction
+                if return_operators:
+                    operator_steps.append(forward_prediction)
 
             next_frames = torch.zeros_like(current_input)
             if mask_next.any():
@@ -484,14 +494,16 @@ class NikaBlock(nn.Module):
             if mask_next.any():
                 backward_prediction = backward_operator(torch.cat([current_input, next_frames], dim=1), norm_t_next)
                 operator_residual += backward_prediction
-
+                if return_operators:
+                    operator_steps.append(backward_prediction)
         aggregated = current_input + operator_residual
         refined = self.upres(aggregated)
 
         if return_operators:
-            refined_forward = self.upres(forward_prediction)
-            refined_backward = self.upres(backward_prediction)
-            return refined, refined_forward, refined_backward
+            operator_residuals = []
+            for op in operator_steps:
+                operator_residuals.append(self.upres(op))
+            return refined, *operator_residuals
         return refined
 
     def test_images(self, output_dir):
@@ -573,14 +585,14 @@ def feature_test(vid, name, config, device):
         T_0=200,
         T_mult=2,
         eta_min=base_lr * 0.1,
-        max_epochs=2000,
+        max_epochs=3000,
         final_multiplier=0.2,
     )
 
     best_psnr = float('-inf')
     best_epoch = -1
 
-    for epoch in range(2000):
+    for epoch in range(3000):
         opt.zero_grad(set_to_none=True)
         loss = 0.0
         start_time = time.time()
@@ -619,8 +631,8 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:1"
-    name = "shake"
+    device = "cuda:0"
+    name = "honey"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")

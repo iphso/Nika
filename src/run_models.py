@@ -43,7 +43,7 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
 
 def benchmark_psnr(basedir, vid_name, config, device):
     vid = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
-    model = get_best_model("models/ref_models/d35975e/{config}", vid.shape, vid_name, config, device)
+    model = get_best_model(f"models/ref_models/", vid.shape, vid_name, config, device)
 
     core_image = model.grid_features.grid.data.cpu().numpy().copy()
     print(f"Core image shape: {core_image.shape}, value range: [{core_image.min()}, {core_image.max()}]")
@@ -64,7 +64,7 @@ def benchmark_psnr(basedir, vid_name, config, device):
     total_psnr = 0.0
     num_frames = vid.shape[0]
 
-    batch_size = 10
+    batch_size = 6
     num_batches = (num_frames + batch_size - 1) // batch_size
     with torch.no_grad():
         for batch_idx in range(num_batches):
@@ -131,25 +131,16 @@ def make_mp4(png_frame_dir, output_path="output.mp4", base_name="pred_frame", fp
     subprocess.run(cmd, check=True)
 
 
-def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None, batch_size=10):
-    """Run several ablation variants using `NikaBlock.forward` flags and save frames.
-
-    Variants (default):
-      - 'baseline'
-      - 'no_tucker' (zero both real and complex tucker heads)
-      - 'zero_real'
-      - 'zero_complex'
-      - 'forward_backward_upres' (use the forward/back outputs passed through `upres`)
-    """
+def module_visualization(basedir, vid_name, n_frames, config, device, variants=None, batch_size=6):
     if variants is None:
-        variants = ['baseline', 'only_grid', 'only_realt', 'only_complext', 'gridless', 'forward_backward_upres']
+        variants = ['baseline', 'only_real_grid', 'only_realt', 'only_complex_grid', 'only_complext', 'temporal_operators']
 
     # Determine model input shape using a single-frame probe (avoids loading full video)
     probe = load_video_frames(f"{basedir}/{vid_name}", device, max_frames=1, dtype=torch.uint8, normalize=False)
     probe_shape = probe.shape  # (T_probe, C, H, W)
     # Use the provided `n_frames` for temporal length, but match spatial/channel dims from probe
     vid_shape = [n_frames, probe_shape[1], probe_shape[2], probe_shape[3]]
-    model = get_best_model(f"models/ref_models/d35975e/{config}", vid_shape, vid_name, config, device)
+    model = get_best_model(f"models/ref_models/", vid_shape, vid_name, config, device)
     model.eval()
 
     num_frames = int(n_frames)
@@ -159,9 +150,12 @@ def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None,
         # create main preds dir for variant
         os.makedirs(f"visuals/{vid_name}/{config}/{v}/preds", exist_ok=True)
         # if storing forward/back separately, create subfolders
-        if v == 'forward_backward_upres':
-            os.makedirs(f"visuals/{vid_name}/{config}/{v}/forward/preds", exist_ok=True)
-            os.makedirs(f"visuals/{vid_name}/{config}/{v}/backward/preds", exist_ok=True)
+        if v == 'temporal_operators':
+            os.makedirs(f"visuals/{vid_name}/{config}/{v}/minus_one/preds", exist_ok=True)
+            os.makedirs(f"visuals/{vid_name}/{config}/{v}/plus_one/preds", exist_ok=True)
+            os.makedirs(f"visuals/{vid_name}/{config}/{v}/minus_two/preds", exist_ok=True)
+            os.makedirs(f"visuals/{vid_name}/{config}/{v}/plus_two/preds", exist_ok=True)
+            os.makedirs(f"visuals/{vid_name}/{config}/{v}/full_operator_residual/preds", exist_ok=True)
 
     with torch.no_grad():
         for batch_idx in range(num_batches):
@@ -176,48 +170,50 @@ def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None,
                 out_base = model(norm_t_batch)
 
             # zeroed variants use forward flags
-            if 'only_grid' in variants:
-                out_no_tucker = model(norm_t_batch, zero_real_tucker=True, zero_complex_tucker=True)
+            if 'only_real_grid' in variants:
+                out_real_grid = model(norm_t_batch, zero_real_tucker=True, zero_complex_tucker=True, zero_complex_grid=True)
             if 'only_realt' in variants:
-                out_zero_real = model(norm_t_batch, zero_complex_tucker=True, zero_feature_grid=True)
+                out_realt = model(norm_t_batch, zero_feature_grid=True, zero_complex_tucker=True, zero_complex_grid=True)
+            if 'only_complex_grid' in variants:
+                out_complex_grid = model(norm_t_batch, zero_real_tucker=True, zero_feature_grid=True, zero_complex_tucker=True)
             if 'only_complext' in variants:
-                out_zero_complex = model(norm_t_batch, zero_real_tucker=True, zero_feature_grid=True)
-            if 'gridless' in variants:
-                out_backless = model(norm_t_batch, zero_feature_grid=True)
+                out_complext = model(norm_t_batch, zero_real_tucker=True, zero_feature_grid=True, zero_complex_grid=True)
 
             # forward/backward operators passed through upres
-            if 'forward_backward_upres' in variants:
+            if 'temporal_operators' in variants:
                 # model.forward(..., return_operators=True) -> (refined, refined_forward, refined_backward)
-                _, refined_forward, refined_backward = model(norm_t_batch, return_operators=True)
-                out_forward = refined_forward
-                out_backward = refined_backward
+                _, minus_one, plus_one, minus_two, plus_two = model(norm_t_batch, return_operators=True)
+                full_operator_residual = minus_one + plus_one + minus_two + plus_two
 
             # save per-variant frames
             for i in range(t_batch.shape[0]):
                 idx = min_t + i
                 if 'baseline' in variants:
                     save_image(out_base[i], f"visuals/{vid_name}/{config}/baseline/preds/pred_frame{idx:03d}.png")
-                if 'only_grid' in variants:
-                    save_image(out_no_tucker[i], f"visuals/{vid_name}/{config}/only_grid/preds/pred_frame{idx:03d}.png")
+                if 'only_real_grid' in variants:
+                    save_image(out_real_grid[i], f"visuals/{vid_name}/{config}/only_real_grid/preds/pred_frame{idx:03d}.png")
                 if 'only_realt' in variants:
-                    save_image(out_zero_real[i], f"visuals/{vid_name}/{config}/only_realt/preds/pred_frame{idx:03d}.png")
+                    save_image(out_realt[i], f"visuals/{vid_name}/{config}/only_realt/preds/pred_frame{idx:03d}.png")
+                if 'only_complex_grid' in variants:
+                    save_image(out_complex_grid[i], f"visuals/{vid_name}/{config}/only_complex_grid/preds/pred_frame{idx:03d}.png")
                 if 'only_complext' in variants:
-                    save_image(out_zero_complex[i], f"visuals/{vid_name}/{config}/only_complext/preds/pred_frame{idx:03d}.png")
-                if 'gridless' in variants:
-                    save_image(out_backless[i], f"visuals/{vid_name}/{config}/gridless/preds/pred_frame{idx:03d}.png")
-                if 'forward_backward_upres' in variants:
-                    save_image(out_forward[i], f"visuals/{vid_name}/{config}/forward_backward_upres/forward/preds/pred_frame{idx:03d}.png")
-                    save_image(out_backward[i], f"visuals/{vid_name}/{config}/forward_backward_upres/backward/preds/pred_frame{idx:03d}.png")
+                    save_image(out_complext[i], f"visuals/{vid_name}/{config}/only_complext/preds/pred_frame{idx:03d}.png")
+                if 'temporal_operators' in variants:
+                    save_image(minus_one[i], f"visuals/{vid_name}/{config}/temporal_operators/minus_one/preds/pred_frame{idx:03d}.png")
+                    save_image(plus_one[i], f"visuals/{vid_name}/{config}/temporal_operators/plus_one/preds/pred_frame{idx:03d}.png")
+                    save_image(minus_two[i], f"visuals/{vid_name}/{config}/temporal_operators/minus_two/preds/pred_frame{idx:03d}.png")
+                    save_image(plus_two[i], f"visuals/{vid_name}/{config}/temporal_operators/plus_two/preds/pred_frame{idx:03d}.png")
+                    save_image(full_operator_residual[i], f"visuals/{vid_name}/{config}/temporal_operators/full_operator_residual/preds/pred_frame{idx:03d}.png")
 
-    # make mp4s
-    # make mp4s
+    # make mp4s for each variant
     for v in variants:
         try:
-            if v == 'forward_backward_upres':
-                fwd_src = f"visuals/{vid_name}/{config}/{v}/forward/preds"
-                bwd_src = f"visuals/{vid_name}/{config}/{v}/backward/preds"
-                make_mp4(fwd_src, output_path=f"visuals/{vid_name}/{config}/forward.mp4", base_name="pred_frame", fps=24)
-                make_mp4(bwd_src, output_path=f"visuals/{vid_name}/{config}/backward.mp4", base_name="pred_frame", fps=24)
+            if v == 'temporal_operators':
+                for op in ['minus_one', 'plus_one', 'minus_two', 'plus_two', 'full_operator_residual']:
+                    src_dir = f"visuals/{vid_name}/{config}/{v}/{op}/preds"
+                    out_path = f"visuals/{vid_name}/{config}/{v}/{op}.mp4"
+                    make_mp4(src_dir, output_path=out_path, base_name="pred_frame", fps=24)
+
             else:
                 src_dir = f"visuals/{vid_name}/{config}/{v}/preds"
                 out_path = f"visuals/{vid_name}/{config}/{v}.mp4"
@@ -226,87 +222,14 @@ def ablation_harness(basedir, vid_name, n_frames, config, device, variants=None,
             print(f"Failed to create mp4 for {v}: {e}")
 
 
-def explain(vid, device):
-    batch_size = 50
-
-    # reference sizes
-    # 3.3M config
-    small_grid_ranks = [2, 60, 70, 120]  # 1M params
-    small_real_tucker = [2, 80, 80, 80]  # 1.1M params
-    small_complex_tucker = [2, 60, 60, 60]  # 1M params
-    small_hidden = 150  # 0.1M params
-
-    model = NikaBlock(
-        target_shape=[3, vid.shape[2], vid.shape[3], vid.shape[0]],
-        k=4,
-        real_tucker_ranks=small_real_tucker,
-        complex_tucker_ranks=small_complex_tucker,
-        grid_ranks=small_grid_ranks,
-        conv_hidden=small_hidden,
-        out_channels=3,
-        device=device,
-    )
-    model.load_state_dict(torch.load("models/beauty-model.torch"))
-    model.eval()
-
-    opt = SOAP(list(model.parameters()), lr=1e-2)
-
-    opt.zero_grad(set_to_none=True)
-    loss = 0.0
-    start_time = time.time()
-
-    def rescale(img):
-        rescaled = (img - img.min()) / (img.max() - img.min())
-        return rescaled
-
-    for t in range(vid.shape[0] // batch_size):
-        min_t = t * batch_size; max_t = (t + 1) * batch_size
-        batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
-        t_batch = torch.linspace(min_t, max_t - 1, steps=(max_t - min_t), dtype=torch.int64, device=device)
-        prediction = model(t_batch)
-        pixel_sum = prediction.sum()
-        upres_input_grad = grad(pixel_sum, model.upres.inputs)[0]
-        contributions = upres_input_grad.abs().mean(dim=(2, 3))
-        print(contributions)
-        absed = []
-        for i in range(9):
-            save_image(rescale(upres_input_grad[0,i,...]), f"visuals/frame0_channel{i}.png")
-            abs_i = rescale(upres_input_grad[0,i,...]).abs()
-            save_image(abs_i, f"visuals/frame0_channel{i}_abs.png")
-            absed.append(abs_i)
-
-        intensities = []
-        for start in range(0, 9, 3):
-            combined = torch.stack(absed[start:start+3], axis=0)
-            intensity = combined.norm(dim=0)
-            intensities.append(intensity)
-            intensity = intensity / intensity.max()
-            names = {
-                0: 'real',
-                3: 'imaginary',
-                6: 'feature_grid'
-            }
-            save_image(combined, f"visuals/{names[start]}_independent_norm.png")
-            save_image(intensity, f"visuals/{names[start]}_intensity.png")
-
-        save_image(rescale(torch.stack(intensities, axis=0)), "visuals/merge_all_the_things.png")
-        save_image(rescale(upres_input_grad[0,:3,...]), "visuals/real_branch_frame0.png")
-        save_image(rescale(upres_input_grad[0,3:6,...]), "visuals/imaginary_branch_frame0.png")
-        save_image(rescale(upres_input_grad[0,6:,...]), "visuals/feature_grid_branch_frame0.png")
-        save_image(rescale(upres_input_grad[0,:3,...]).abs(), "visuals/real_branch_abs_frame0.png")
-        save_image(rescale(upres_input_grad[0,3:6,...]).abs(), "visuals/imaginary_branch_abs_frame0.png")
-        save_image(rescale(upres_input_grad[0,6:,...]).abs(), "visuals/feature_grid_branch_abs_frame0.png")
-        import pdb; pdb.set_trace()
-
-
 if __name__ == "__main__":
     device = "cuda:1"
-    name = "beauty"
-    config = "small"
+    name = "shake"
+    config = "large"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    ablation_harness("static/benchmarks/uvg", name, n_frames=600, config=config, device=device)
+    module_visualization("static/benchmarks/uvg", name, n_frames=300, config=config, device=device)
     # benchmark_psnr("static/benchmarks/uvg", name, config, device)
     # make_mp4(f"visuals/{name}/{config}/preds", output_path=f"visuals/{name}/{config}/preds/output.mp4", base_name="pred_frame", fps=24)
     # make_mp4(f"visuals/{name}/{config}/residual", output_path=f"visuals/{name}/{config}/residual/output.mp4", base_name="residual_frame", fps=24)
