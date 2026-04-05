@@ -139,7 +139,7 @@ class RealTucker(nn.Module):
 
 class ComplexTucker(RealTucker):
 
-    def __init__(self, target_shape, ranks, device='cuda'):
+    def __init__(self, target_shape, ranks, grid_res, device='cuda'):
         super().__init__(target_shape, ranks, device=device)
         self.half_W = (self.W // 2) + 1
         self.UH = TuckerFactor(self.H, self.rH, is_complex=True, device=device)
@@ -151,7 +151,13 @@ class ComplexTucker(RealTucker):
         self.G_real = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
         self.G_imag = nn.Parameter(torch.zeros(self.rT, self.rC, self.rH, self.rW, device=device))
 
-        self.feature_grid = FeatureGrid([self.C * 2, self.H, self.half_W, self.T], grid_res=[self.C * 2, self.H, self.half_W, 1], device=device)
+        grid_c, grid_h, grid_w, grid_t = grid_res
+        half_grid_w = (grid_w // 2) + 1
+        print(f"target shape: C={self.C}, H={self.H}, W={self.W}, T={self.T}")
+        print(f"Initializing complex tucker with ranks: C={self.rC}, H={self.rH}, W={self.rW}, T={self.rT}")
+        print(f"Initializing feature grid with resolution: C={grid_c}, H={grid_h}, W={grid_w}, T={grid_t}")
+
+        self.feature_grid = FeatureGrid([self.C * 2, self.H, self.half_W, self.T], grid_res=[grid_c, grid_h, half_grid_w, grid_t], device=device)
 
     def forward(self, t, zero_complex_tucker=False, zero_complex_grid=False):
         construct = torch.zeros((t.shape[0], self.C, self.H, self.half_W), device=t.device, dtype=torch.complex64)
@@ -368,6 +374,7 @@ class NikaBlock(nn.Module):
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
             ranks=complex_tucker_ranks,
+            grid_res=grid_ranks,
             device=device,
         )
 
@@ -631,10 +638,10 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:0"
-    name = "honey"
+    device = "cuda:1"
+    name = "shake"
     torch.manual_seed(42)
-    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=600, dtype=torch.uint8, normalize=False)
+    vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=300, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
