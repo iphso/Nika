@@ -131,7 +131,7 @@ def make_mp4(png_frame_dir, output_path="output.mp4", base_name="pred_frame", fp
     subprocess.run(cmd, check=True)
 
 
-def module_visualization(basedir, vid_name, n_frames, config, device, variants=None, batch_size=6):
+def module_visualization(basedir, vid_name, n_frames, config, device, variants=None, batch_size=6, commit="3db530e"):
     if variants is None:
         variants = ['baseline', 'only_real_grid', 'only_realt', 'only_complex_grid', 'only_complext', 'temporal_operators']
 
@@ -140,7 +140,7 @@ def module_visualization(basedir, vid_name, n_frames, config, device, variants=N
     probe_shape = probe.shape  # (T_probe, C, H, W)
     # Use the provided `n_frames` for temporal length, but match spatial/channel dims from probe
     vid_shape = [n_frames, probe_shape[1], probe_shape[2], probe_shape[3]]
-    model = get_best_model(f"models/ref_models/", vid_shape, vid_name, config, device)
+    model = get_best_model(f"models/ref_models/{commit}/{config}", vid_shape, vid_name, config, device)
     model.eval()
 
     num_frames = int(n_frames)
@@ -224,12 +224,12 @@ def module_visualization(basedir, vid_name, n_frames, config, device, variants=N
 
 if __name__ == "__main__":
     device = "cuda:1"
-    name = "shake"
-    config = "large"
+    name = "bunny"
+    config = "xs"
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    module_visualization("static/benchmarks/uvg", name, n_frames=300, config=config, device=device)
+    module_visualization("static/benchmarks", name, n_frames=132, config=config, device=device)
     # benchmark_psnr("static/benchmarks/uvg", name, config, device)
     # make_mp4(f"visuals/{name}/{config}/preds", output_path=f"visuals/{name}/{config}/preds/output.mp4", base_name="pred_frame", fps=24)
     # make_mp4(f"visuals/{name}/{config}/residual", output_path=f"visuals/{name}/{config}/residual/output.mp4", base_name="residual_frame", fps=24)
