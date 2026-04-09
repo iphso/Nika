@@ -21,99 +21,95 @@ from encoding_utils import FourierEncoding
 from configs import REFERENCES
 
 
-class TuckerFactor(nn.Module):
-    def __init__(self, target_dim, rank, is_complex=False, base_mag=1e-2, device='cuda'):
-        """
-        Have to split into chunks because there's some weird bug in PyTorch
-        where if the dim is over like 520 or something everything just breaks.
-
-        Perhaps someone can figure that out later, but the workaround seems easier atm.
-        """
+class SimpleTuckerFactor(nn.Module):
+    def __init__(self, target_dim, rank, is_complex=False, device='cuda'):
         super().__init__()
-        self.max_chunk_size = 500
         self.target_dim = target_dim
-        self.rank = rank
         self.is_complex = is_complex
+        if self.is_complex:
+            self.U_real = nn.Parameter(torch.randn(target_dim, rank, device=device) * 1e-2)
+            self.U_imag = nn.Parameter(torch.zeros(target_dim, rank, device=device))
+        else:
+            self.U = nn.Parameter(torch.randn(target_dim, rank, device=device) * 1e-2)
+        self.dU = 1 / target_dim
         self.device = device
-
-        def make_chunk(chunk_size):
+    
+    def forward(self, target=None, index=None):
+        if target is not None and index is not None:
+            raise ValueError("Cannot specify both target and index")
+        if target is None and index is None:
             if self.is_complex:
-                return nn.Parameter(torch.randn(chunk_size, rank, device=device) * base_mag), \
-                          nn.Parameter(torch.zeros(chunk_size, rank, device=device))  # real, imag
-            else:
-                return nn.Parameter(torch.randn(chunk_size, rank, device=device) * base_mag)
-        num_chunks = int((target_dim - 1) // self.max_chunk_size) + 1
-        self.chunked = False
-        if num_chunks > 1:
-            self.chunked = True
+                return torch.complex(self.U_real, self.U_imag)
+            return self.U
+        if target is not None:
+            target_t = torch.as_tensor(target, device=self.device, dtype=torch.float32)
+            target_index = torch.floor(target_t * float(self.target_dim)).to(torch.long)
+            index = torch.clamp(target_index, max=self.target_dim - 1, min=0)
+        if self.is_complex:
+            return torch.complex(self.U_real[index], self.U_imag[index])
+        return self.U[index]
+    
+    def get_range(self, targets=None, indices=None, pad_to=None, pad_mode='border'):
+        if targets is not None and indices is not None:
+            raise ValueError("Cannot specify both targets and indices")
+        elif targets is not None:
+            if len(targets) != 2:
+                raise ValueError("targets must be a (start, end) pair")
+            start_t, end_t = targets
+            start_idx = int(float(start_t) * float(self.target_dim))
+            end_idx = int(float(end_t) * float(self.target_dim))
+            indices = (start_idx, end_idx)
+        if indices is None:
+            raise ValueError("Must specify targets or indices")
 
-        if self.chunked:
-            if self.is_complex:
-                self.real_chunks = nn.ParameterList()
-                self.imag_chunks = nn.ParameterList()
-            else:
-                self.chunks = nn.ParameterList()
+        if len(indices) != 2:
+            raise ValueError("indices/targets must be a (start, end) pair")
 
-            for i in range(num_chunks):
-                start = i * self.max_chunk_size
-                end = min((i + 1) * self.max_chunk_size, target_dim)
-                chunk_size = end - start
-                if self.is_complex:
-                    real_param, imag_param = make_chunk(chunk_size)
-                    self.real_chunks.append(real_param)
-                    self.imag_chunks.append(imag_param)
+        start_idx = max(0, min(int(start_idx), self.target_dim - 1))
+        end_idx = max(0, min(int(end_idx), self.target_dim - 1))
+
+        end_exclusive = end_idx + 1
+        if self.is_complex:
+            chunk = torch.complex(self.U_real[start_idx:end_exclusive], self.U_imag[start_idx:end_exclusive])
+        else:
+            chunk = self.U[start_idx:end_exclusive]
+
+        if pad_to is not None and pad_to > chunk.shape[0]:
+            needed = pad_to - chunk.shape[0]
+            # allow right-pad only if we reached the end index
+            if end_idx == self.target_dim - 1:
+                if pad_mode == 'border':
+                    pad_chunk = chunk[-1:].expand(needed, -1)
+                elif pad_mode == 'zeros':
+                    pad_chunk = torch.zeros((needed, chunk.shape[1]), device=chunk.device, dtype=chunk.dtype)
                 else:
-                    param = make_chunk(chunk_size)
-                    self.chunks.append(param)
-        else:
-            if self.is_complex:
-                self.U_real = nn.Parameter(torch.randn(target_dim, rank, device=device) * base_mag)
-                self.U_imag = nn.Parameter(torch.zeros(target_dim, rank, device=device))
+                    raise ValueError("Invalid pad_mode")
+                chunk = torch.cat([chunk, pad_chunk], dim=0)
+            # allow left-pad only if we started at index 0
+            elif start_idx == 0:
+                if pad_mode == 'border':
+                    pad_chunk = chunk[:1].expand(needed, -1)
+                elif pad_mode == 'zeros':
+                    pad_chunk = torch.zeros((needed, chunk.shape[1]), device=chunk.device, dtype=chunk.dtype)
+                else:
+                    raise ValueError("Invalid pad_mode")
+                chunk = torch.cat([pad_chunk, chunk], dim=0)
             else:
-                self.U = nn.Parameter(torch.randn(target_dim, rank, device=device) * base_mag)
-
-    def forward(self):
-        if self.chunked:
-            if self.is_complex:
-                real_parts = []
-                imag_parts = []
-                for r_chunk, i_chunk in zip(self.real_chunks, self.imag_chunks):
-                    real_parts.append(r_chunk)
-                    imag_parts.append(i_chunk)
-                U_real = torch.cat(real_parts, dim=0)
-                U_imag = torch.cat(imag_parts, dim=0)
-                U = torch.complex(U_real, U_imag)
-            else:
-                parts = []
-                for chunk in self.chunks:
-                    parts.append(chunk)
-                U = torch.cat(parts, dim=0)
-        else:
-            if self.is_complex:
-                U = torch.complex(self.U_real, self.U_imag)
-            else:
-                U = self.U
-        return U
-
-    def get(self, target):
-        U = self.forward()
-        target = torch.as_tensor(target, device=U.device, dtype=torch.float32)
-
-        t_norm = 2.0 * target - 1.0  # [-1, 1]
-        t_norm = t_norm.view(1, -1, 1, 1)
-
-        grid = torch.zeros((1, t_norm.shape[1], 1, 2), device=U.device, dtype=t_norm.dtype)
-        grid[..., 1] = t_norm.squeeze(-1)  # y coord (H)
-        # x coord (W=1) stays 0
-
-        def _sample(inp):
-            inp_ = inp.transpose(0, 1).unsqueeze(0).unsqueeze(-1)  # [1, R, T, 1]
-            out = F.grid_sample(inp_, grid, mode="bilinear", align_corners=True, padding_mode="border")
-            return out.squeeze(0).squeeze(-1).transpose(0, 1)  # [B, R]
-
-        if torch.is_complex(U):
-            return torch.complex(_sample(U.real), _sample(U.imag))
-        return _sample(U)
+                raise ValueError("Padding invalid: can only left-pad if start index is 0 or right-pad if end index reaches target_dim-1")
+        elif pad_to is not None and pad_to < chunk.shape[0]:
+            pad_to = int(pad_to)
+            if pad_to <= 0:
+                raise ValueError("pad_to must be a positive integer")
+            cur_len = int(chunk.shape[0])
+            center = cur_len // 2
+            half = pad_to // 2
+            start = max(0, center - half)
+            end = start + pad_to
+            if end > cur_len:
+                end = cur_len
+                start = max(0, end - pad_to)
+            chunk = chunk[start:end]
+        return chunk
 
 
 class RealTucker(nn.Module):
@@ -122,15 +118,15 @@ class RealTucker(nn.Module):
         self.C, self.H, self.W, self.T = target_shape
         self.rC, self.rH, self.rW, self.rT = ranks
 
-        self.UH = TuckerFactor(self.H, self.rH, is_complex=False, device=device)
-        self.UW = TuckerFactor(self.W, self.rW, is_complex=False, device=device)
-        self.UC = TuckerFactor(self.C, self.rC, is_complex=False, device=device)
-        self.UT = TuckerFactor(self.T, self.rT, is_complex=False, device=device)
+        self.UH = SimpleTuckerFactor(self.H, self.rH, is_complex=False, device=device)
+        self.UW = SimpleTuckerFactor(self.W, self.rW, is_complex=False, device=device)
+        self.UC = SimpleTuckerFactor(self.C, self.rC, is_complex=False, device=device)
+        self.UT = SimpleTuckerFactor(self.T, self.rT, is_complex=False, device=device)
 
         self.G = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
 
-    def forward(self, t):
-        UT = self.UT.get(t)
+    def forward(self, **kwargs):
+        UT = self.UT.get_range(**kwargs)
         UC = self.UC()
         UH = self.UH()
         UW = self.UW()
@@ -142,39 +138,42 @@ class ComplexTucker(RealTucker):
     def __init__(self, target_shape, ranks, grid_res, device='cuda'):
         super().__init__(target_shape, ranks, device=device)
         self.half_W = (self.W // 2) + 1
-        self.UH = TuckerFactor(self.H, self.rH, is_complex=True, device=device)
-        self.UW = TuckerFactor(self.half_W, self.rW, is_complex=True, device=device)
-        self.UC = TuckerFactor(self.C, self.rC, is_complex=True, device=device)
-        self.UT = TuckerFactor(self.T, self.rT, is_complex=True, device=device)
+        self.UH = SimpleTuckerFactor(self.H, self.rH, is_complex=True, device=device)
+        self.UW = SimpleTuckerFactor(self.half_W, self.rW, is_complex=True, device=device)
+        self.UC = SimpleTuckerFactor(self.C, self.rC, is_complex=True, device=device)
+        self.UT = SimpleTuckerFactor(self.T, self.rT, is_complex=True, device=device)
 
         self.G = None  # override parent
         self.G_real = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
         self.G_imag = nn.Parameter(torch.zeros(self.rT, self.rC, self.rH, self.rW, device=device))
 
-        grid_c, grid_h, grid_w, grid_t = grid_res
+        grid_c, grid_h, grid_w = grid_res
         half_grid_w = (grid_w // 2) + 1
         print(f"target shape: C={self.C}, H={self.H}, W={self.W}, T={self.T}")
         print(f"Initializing complex tucker with ranks: C={self.rC}, H={self.rH}, W={self.rW}, T={self.rT}")
-        print(f"Initializing feature grid with resolution: C={grid_c}, H={grid_h}, W={grid_w}, T={grid_t}")
+        print(f"Initializing feature grid with resolution: C={grid_c}, H={grid_h}, W={grid_w}")
 
-        self.feature_grid = FeatureGrid([self.C * 2, self.H, self.half_W, self.T], grid_res=[grid_c, grid_h, half_grid_w, grid_t], device=device)
+        self.feature_grid = FeatureGrid([self.C * 2, self.H, self.half_W, self.T], grid_res=[grid_c, grid_h, half_grid_w], device=device)
 
-    def forward(self, t, zero_complex_tucker=False, zero_complex_grid=False):
-        construct = torch.zeros((t.shape[0], self.C, self.H, self.half_W), device=t.device, dtype=torch.complex64)
+    def forward(self, zero_complex_tucker=False, zero_complex_grid=False, **kwargs):
+        # construct = torch.zeros((t.shape[0], self.C, self.H, self.half_W), device=t.device, dtype=torch.complex64)
+        B = kwargs.get('pad_to', None)
         if not zero_complex_tucker:
             UH = self.UH()
             UW = self.UW()
             UC = self.UC()
-            UT = self.UT.get(t)
+            UT = self.UT.get_range(**kwargs)
             G = torch.complex(self.G_real, self.G_imag)
             construct = tucker_construct(UT, UC, UH, UW, G)
 
         if not zero_complex_grid:
-            grid = self.feature_grid(t)
+            grid = self.feature_grid(B)
             complex_grid = torch.complex(*grid.chunk(2, dim=1))
             if zero_complex_tucker:
                  construct = complex_grid
             else:
+                if construct.shape[0] == 6:
+                    print(f"kwargs: {kwargs}")
                 construct = construct * complex_grid
         real_tucker = torch.fft.irfft2(construct, norm='ortho').real
         return real_tucker.contiguous()
@@ -196,48 +195,39 @@ class FeatureGrid(nn.Module):
         self.grid_c = grid_res[0]
         self.grid_h = grid_res[1]
         self.grid_w = grid_res[2]
-        self.grid_t = grid_res[3]
 
-        self.grid = nn.Parameter(torch.randn(self.grid_c, self.grid_h, self.grid_w, self.grid_t, device=device) * 1e-2)
+        self.grid = nn.Parameter(torch.randn(1, self.grid_c, self.grid_h, self.grid_w, device=device) * 1e-2)
         if self.grid_c != self.C:
             self.channel_proj = nn.Linear(self.grid_c, self.C, bias=True).to(device)
             nn.init.normal_(self.channel_proj.weight, mean=0.0, std=0.02)
             nn.init.zeros_(self.channel_proj.bias)
         self.register_buffer(
             "_xy_base",
-            grid_sample_base(self.H, self.W, device=device),
+            grid_sample_base(self.H, self.W, device=device).unsqueeze(0),  # [1, H, W, 2]
             persistent=False
         )
 
         self._grid_5d_view = None
-    
-    def _5d_grid(self):
-        return self.grid.permute(0, 3, 1, 2).unsqueeze(0)
 
-    def forward(self, t):
+    def forward(self, B):
         device = self.grid.device
-        B = t.shape[0]
+        sample_grid2 = self._xy_base.expand(B, -1, -1, -1)  # [B, H_out, W_out, 2]
 
-        sample_grid3 = torch.empty((B, self.H, self.W, 3), device=device, dtype=self._xy_base.dtype)
-        sample_grid3[..., :2] = self._xy_base
-        sample_grid3[..., 2] = (2.0 * t - 1.0).view(B, 1, 1)
-
-        sample_grid3 = sample_grid3.unsqueeze(1)  # [B,1,H,W,3]
-
-        grid_5d = self._5d_grid().expand(B, -1, -1, -1, -1)
+        if hasattr(self, 'channel_proj'):
+            proj = self.channel_proj(self.grid.permute(0, 2, 3, 1))  # -> [1, H_g, W_g, C]
+            grid_4d = proj.permute(0, 3, 1, 2).expand(B, -1, -1, -1)  # -> [B, C, H_g, W_g]
+        else:
+            grid_4d = self.grid.expand(B, -1, -1, -1)  # [B, grid_c, H_g, W_g]
 
         sampled = F.grid_sample(
-            grid_5d,               # [B, C, T_g, H_g, W_g]
-            sample_grid3,           # [B, 1, H_out, W_out, 3]
+            grid_4d,            # [B, C_or_grid_c, H_g, W_g]
+            sample_grid2,       # [B, H_out, W_out, 2]
             mode='bilinear',
             align_corners=False,
             padding_mode='border',
-        )  # → [B, C, 1, H_out, W_out]
+        )  # -> [B, C_or_grid_c, H_out, W_out]
 
-        result = sampled.squeeze(2)
-        if hasattr(self, 'channel_proj'):
-            result = self.channel_proj(result.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        return result.contiguous()
+        return sampled.contiguous()
 
 
 def tucker_construct(UT, UC, UH, UW, G):
@@ -333,14 +323,8 @@ class ConvOperator(nn.Module):
         nn.init.zeros_(self.t_modulator[-1].bias)
 
     def forward(self, x, t):
-        if x.all() == 0:
-            return torch.zeros(
-                (x.shape[0], self.out_channels, x.shape[2], x.shape[3]),
-                device=self.device,
-                dtype=x.dtype,
-            )
         initial = self.operator_head(x)
-        time_emb = self.encoding(t)
+        time_emb = self.encoding(torch.as_tensor(t, device=x.device, dtype=torch.float32))
         modulation = self.t_modulator(time_emb)
         gamma, beta = modulation.chunk(2, dim=-1)
         gamma = gamma.view(-1, self.operator_head[-1].out_channels, 1, 1)
@@ -362,14 +346,14 @@ class NikaBlock(nn.Module):
             ranks=real_tucker_ranks,
             device=device,
         )
-        self.real_tucker = torch.compile(self.real_tucker)
+        # self.real_tucker = torch.compile(self.real_tucker)
 
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
             device=device,
         )
-        self.grid_features = torch.compile(self.grid_features)
+        # self.grid_features = torch.compile(self.grid_features)
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
@@ -381,10 +365,17 @@ class NikaBlock(nn.Module):
         self.n_heads = 3
 
         self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
-        self.groupnorm = torch.compile(self.groupnorm)
+        # self.groupnorm = torch.compile(self.groupnorm)
 
         op_hdim = 64
         self.operator_steps = 2
+        self.B = self.operator_steps * 2 + 1
+
+        self.register_buffer(
+            "_zero_base",
+            torch.zeros((self.B, self.C, self.H, self.W), device=device),
+            persistent=False
+        )
 
         self.forward_operators = nn.ModuleList()
         self.backward_operators = nn.ModuleList()
@@ -401,8 +392,10 @@ class NikaBlock(nn.Module):
                 h_dim = op_hdim,
                 device = device,
             )
-            self.forward_operators.append(torch.compile(fwd))
-            self.backward_operators.append(torch.compile(bwd))
+            self.forward_operators.append(fwd)
+            self.backward_operators.append(bwd)
+            # self.forward_operators.append(torch.compile(fwd))
+            # self.backward_operators.append(torch.compile(bwd))
 
         self.upres = BasicUpres(
             in_channels = self.n_heads * self.C,
@@ -411,7 +404,7 @@ class NikaBlock(nn.Module):
             k = k,    
             device = device,
         )
-        self.upres = torch.compile(self.upres)
+        # self.upres = torch.compile(self.upres)
 
         self.log_stats()
 
@@ -435,104 +428,92 @@ class NikaBlock(nn.Module):
         if type(norm_t) is not torch.Tensor:
             norm_t = torch.tensor([norm_t], device=self.grid_features.grid.device, dtype=torch.float32)
 
-        if not hasattr(self, "_zero_base"):
-            self.register_buffer(
-            "_zero_base",
-            torch.zeros(1, self.C, self.H, self.W, device=norm_t.device, dtype=torch.float32),
-            persistent=False,
-        )
+        min_t = torch.max(torch.tensor(0.0, device=norm_t.device), norm_t.min() - self.dT * self.operator_steps)
+        max_t = torch.min(torch.tensor(1.0, device=norm_t.device), norm_t.max() + self.dT * self.operator_steps)
 
-        zero_base = self._zero_base.expand(norm_t.shape[0], -1, -1, -1)
-        curr_real_tucker = self.real_tucker(norm_t) if not zero_real_tucker else zero_base
-        curr_real_grid = self.grid_features(norm_t) if not zero_feature_grid else zero_base
-        curr_complex_tucker = self.complex_tucker(norm_t, zero_complex_tucker, zero_complex_grid)
+        if not zero_real_tucker:
+            real_tucker = self.real_tucker(targets=(min_t, max_t), pad_to=self.B)
+        else:
+            real_tucker = self._zero_base.expand(self.B, -1, -1, -1)
+        if not zero_feature_grid:
+            grid_features = self.grid_features(self.B)
+        else:
+            grid_features = self._zero_base.expand(self.B, -1, -1, -1)
+        if not zero_complex_tucker or not zero_complex_grid:
+            complex_tucker = self.complex_tucker(
+                zero_complex_tucker=zero_complex_tucker, zero_complex_grid=zero_complex_grid, targets=(min_t, max_t), pad_to=self.B
+            )
+        else:
+            complex_tucker = self._zero_base.expand(self.B, -1, -1, -1)
+        response = torch.cat([real_tucker, grid_features, complex_tucker], dim=1)
+        response = self.groupnorm(response)
+        aggregated = response[self.operator_steps]
 
-        current_base = torch.cat([curr_real_grid, curr_real_tucker, curr_complex_tucker], dim=1)
-        current_input = self.groupnorm(current_base)
-
-        operator_residual = torch.zeros_like(current_input)
         if return_operators:
             operator_steps = []
+
         for i in range(self.operator_steps):
-            step_len = (i + 1) * self.dT
-            mask_prev = (norm_t >= step_len)
-            norm_t_prev = (norm_t[mask_prev] - step_len) if mask_prev.any() else None
-            prev_zero_base = zero_base[mask_prev]
+            prev_t = torch.clamp(norm_t - (i + 1) * self.dT, 0.0, 1.0)
+            prev_idx = self.operator_steps - (i + 1)
+            prev_input = torch.cat(
+                [response[prev_idx:prev_idx + 1], response[self.operator_steps:self.operator_steps + 1]],
+                dim=1,
+            )
+            with record_function(f"operator_forward_{i}"):
+                forward_prediction = self.forward_operators[i](prev_input, prev_t)
 
-            mask_next = (norm_t <= (1 - step_len))
-            norm_t_next = (norm_t[mask_next] + step_len) if mask_next.any() else None
-            next_zero_base = zero_base[mask_next]
+            next_t = torch.clamp(norm_t + (i + 1) * self.dT, 0.0, 1.0)
+            next_idx = self.operator_steps + (i + 1)
+            next_input = torch.cat(
+                [response[next_idx:next_idx + 1], response[self.operator_steps:self.operator_steps + 1]],
+                dim=1,
+            )
+            with record_function(f"operator_backward_{i}"):
+                backward_prediction = self.backward_operators[i](next_input, next_t)
 
-            prev_real_tucker, next_real_tucker = prev_zero_base, next_zero_base
-            prev_complex_tucker, next_complex_tucker = prev_zero_base, next_zero_base
-            prev_grid, next_grid = prev_zero_base, next_zero_base
+            if return_operators:
+                operator_steps.append(forward_prediction)
+                operator_steps.append(backward_prediction)
+            aggregated = aggregated + forward_prediction + backward_prediction
 
-            if not zero_real_tucker:
-                prev_real_tucker = self.real_tucker(norm_t_prev) if mask_prev.any() else zero_base
-                next_real_tucker = self.real_tucker(norm_t_next) if mask_next.any() else zero_base
-            
-            if not zero_feature_grid:
-                prev_grid = self.grid_features(norm_t_prev) if mask_prev.any() else zero_base
-                next_grid = self.grid_features(norm_t_next) if mask_next.any() else zero_base
-
-            if not zero_complex_tucker:
-                prev_complex_tucker = self.complex_tucker(norm_t_prev) if mask_prev.any() else zero_base
-                next_complex_tucker = self.complex_tucker(norm_t_next) if mask_next.any() else zero_base
-
-            prev_base = torch.cat([prev_grid, prev_real_tucker, prev_complex_tucker], dim=1)
-            prev_base = self.groupnorm(prev_base)
-            prev_frames = torch.zeros_like(current_input)
-            if mask_prev.any():
-                prev_frames[mask_prev] = prev_base
-
-            forward_operator = self.forward_operators[i]
-            if mask_prev.any():
-                forward_prediction = forward_operator(torch.cat([prev_frames, current_input], dim=1), norm_t_prev)
-                operator_residual += forward_prediction
-                if return_operators:
-                    operator_steps.append(forward_prediction)
-
-            next_frames = torch.zeros_like(current_input)
-            if mask_next.any():
-                next_base = torch.cat([next_grid, next_real_tucker, next_complex_tucker], dim=1)
-                next_base = self.groupnorm(next_base)
-                next_frames[mask_next] = next_base
-            backward_operator = self.backward_operators[i]
-            if mask_next.any():
-                backward_prediction = backward_operator(torch.cat([current_input, next_frames], dim=1), norm_t_next)
-                operator_residual += backward_prediction
-                if return_operators:
-                    operator_steps.append(backward_prediction)
-        aggregated = current_input + operator_residual
-        refined = self.upres(aggregated)
+        with record_function("upres"):
+            prediction = self.upres(aggregated)
 
         if return_operators:
             operator_residuals = []
             for op in operator_steps:
                 operator_residuals.append(self.upres(op))
-            return refined, *operator_residuals
-        return refined
+            return prediction, *operator_residuals
+        return prediction
 
     def test_images(self, output_dir):
         # self.eval()
         with torch.no_grad():
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
-            rand_vals = torch.linspace(0, self.T - 1, steps=10, dtype=torch.int64, device=self.grid_features.grid.device)
-            torch.cuda.synchronize()
-            start_time = time.time()
-            imgs = self.forward(rand_vals, rand_vals)
-            torch.cuda.synchronize()
-            average_frame_time = (time.time() - start_time) / rand_vals.shape[0]
+            rand_vals = torch.linspace(0, 1, steps=10, dtype=torch.float32, device=self.grid_features.grid.device)
+            imgs = []
+            total_ms = 0.0
+            starter = torch.cuda.Event(enable_timing=True)
+            ender = torch.cuda.Event(enable_timing=True)
+            for rand_val in rand_vals:
+                target = torch.tensor([rand_val], device=self.grid_features.grid.device, dtype=torch.float32)
+                starter.record()
+                img = self.forward(target)
+                ender.record()
+                torch.cuda.synchronize()
+                total_ms += starter.elapsed_time(ender)
+                imgs.append(img.detach().cpu())
+            average_frame_time = (total_ms / rand_vals.shape[0]) / 1000.0
             print(f"Average inference time per frame: {average_frame_time:.5f}s")
             print(f"FPS: {1.0 / average_frame_time:.2f}")
-            for i in range(imgs.shape[0]):
+            for i in range(len(imgs)):
                 img = imgs[i].clamp(0.0, 1.0)
                 save_image(img, f"{output_dir}/frame_{i:04d}.png")
 
 
 def feature_test(vid, name, config, device):
-    batch_size = 6
+    batch_size = 1
     model_kwargs = REFERENCES[config]
     model = NikaBlock(
         target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
@@ -638,11 +619,11 @@ def feature_test(vid, name, config, device):
 
 
 if __name__ == "__main__":
-    device = "cuda:1"
+    device = "cuda:0"
     name = "shake"
     torch.manual_seed(42)
     vid = load_video_frames(f"static/benchmarks/uvg/{name}", device, max_frames=300, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    feature_test(vid, name, f"large", device=device)
+    feature_test(vid, name, f"small", device=device)
