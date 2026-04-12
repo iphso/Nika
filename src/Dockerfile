@@ -4,9 +4,12 @@ WORKDIR /app
 
 COPY . /app
 
+ARG JAX_VERSION=0.9.2
+
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
+    python3-venv \
     libjpeg-dev \
     zlib1g-dev \
     libglx0 \
@@ -30,5 +33,19 @@ RUN pip install numpy \
                 imageio[ffmpeg] \
                 imageio-ffmpeg \
                 scikit-video
+
+# Separate JAX environment. This uses the CUDA 13 plugin packages that matched the
+# working local setup. The current base image remains CUDA 11.8 to preserve the
+# existing Torch workflow; for GPU JAX inside the container, switch the base image
+# to a CUDA 13 compatible runtime.
+RUN python3 -m venv /opt/jax13-venv && \
+    /opt/jax13-venv/bin/pip install --upgrade pip setuptools wheel && \
+    /opt/jax13-venv/bin/pip install \
+      "jax==${JAX_VERSION}" \
+      "jaxlib==${JAX_VERSION}" \
+      "jax-cuda13-plugin==${JAX_VERSION}" \
+      "jax-cuda13-pjrt==${JAX_VERSION}"
+
+ENV XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 EXPOSE 6006
