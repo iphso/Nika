@@ -196,6 +196,45 @@ env -u LD_LIBRARY_PATH XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_PLATFORMS=cuda \
 - JAX render fast path: cached `norm_t` + `batch-size=32`
 - JAX benchmark fast path: cached `norm_t` + `batch-size=32`
 
+## 9. Training Parity Check
+
+Use the dedicated training parity scripts to compare Torch and JAX on the same
+checkpoint, frame sequence, loss, gradients, and SOAP-driven parameter updates.
+
+Record the Torch reference sequence:
+
+```bash
+python3 /app/record_current_torch_training_reference.py \
+  --checkpoint /app/models/small-bunny-epoch200-psnr30.23-clean.torch \
+  --frame-dir /app/static/benchmarks/bunny \
+  --output-dir /app/tmp_training_parity_reference_gpu \
+  --config small \
+  --device cuda:0 \
+  --n-frames 132 \
+  --num-steps 12
+```
+
+Replay that reference in JAX:
+
+```bash
+/opt/jax13-venv/bin/python -u /app/jax_current_train_compare.py \
+  --reference-dir /app/tmp_training_parity_reference_gpu
+```
+
+What this checks:
+
+- scalar loss parity per step
+- decoded prediction parity per step
+- full-parameter gradient parity per step
+- post-SOAP parameter parity per step
+
+Current status from the maintained `small-bunny-epoch200-psnr30.23-clean.torch`
+checkpoint:
+
+- forward loss and prediction parity are very close on GPU before the first real optimizer update
+- gradient parity is close enough to be informative, though some very small tensors already show slightly looser relative error
+- the JAX SOAP implementation is not yet near-identical to Torch: parameter updates diverge on the first real update step and remain out of tolerance after that
+
 ## Key Differences From The Torch Baseline
 
 - The model math is unchanged. JAX still implements the same Tucker, complex grid, groupnorm, operator, and upres path.

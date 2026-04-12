@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import jax
@@ -9,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jax_current_nika import batch_psnr_loss, infer_spec, load_params
-from jax_soap import SOAPHyperParams, init_state, step as soap_step
+from jax_soap import SOAPHyperParams, debug_parameter_step, debug_post_state, init_state, step as soap_step
 
 
 THRESHOLDS = {
@@ -88,6 +89,21 @@ def _check(kind: str, stats: dict[str, object]) -> bool:
     return max_abs_ok and mean_rel_ok
 
 
+def _param_slug(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).replace(".", "__")
+
+
+def _compare_debug_arrays(step_idx: int, param_name: str, actual: dict[str, jnp.ndarray], reference_path: Path) -> None:
+    with np.load(reference_path) as data:
+        reference = {key: data[key] for key in data.files}
+    for key in sorted(reference):
+        if key not in actual:
+            print(json.dumps({"step": step_idx, "component": "soap_debug", "param": param_name, "tensor": key, "missing": True}))
+            continue
+        stats = _stats(np.asarray(actual[key]).astype(reference[key].dtype, copy=False), reference[key])
+        print(json.dumps({"step": step_idx, "component": "soap_debug", "param": param_name, "tensor": key, **stats}))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--reference-dir", required=True)
@@ -116,12 +132,15 @@ def main() -> int:
         correct_bias=bool(optimizer["correct_bias"]),
     )
     opt_state = init_state(params, hparams)
+    watch_params = metadata.get("watch_params", [])
+    watch_steps = set(metadata.get("watch_steps", []))
 
     overall_ok = True
     loss_and_grad = jax.value_and_grad(batch_psnr_loss, has_aux=True)
 
     for step_idx in range(targets.shape[0]):
         step_dir = reference_dir / f"step_{step_idx:03d}"
+        debug_pre: dict[str, dict[str, jnp.ndarray]] = {}
         ((loss, aux), grads) = loss_and_grad(
             params,
             norm_t[step_idx:step_idx + 1],
@@ -147,12 +166,32 @@ def main() -> int:
         overall_ok = overall_ok and gradients_ok
         print(json.dumps({"step": step_idx, "component": "gradients", "ok": gradients_ok, **gradient_stats}))
 
+        if step_idx in watch_steps:
+            for name in watch_params:
+                if name not in params or name not in grads or name not in opt_state:
+                    continue
+                debug_arrays, debug_meta = debug_parameter_step(params[name], grads[name], opt_state[name], hparams)
+                debug_pre[name] = debug_arrays
+                print(json.dumps({"step": step_idx, "component": "soap_debug_meta_pre", "param": name, **debug_meta}))
+
         params, opt_state = soap_step(params, grads, opt_state, hparams)
         reference_params = _load_npz_dict(step_dir / "post_params.npz")
         param_stats = _named_stats(_to_numpy_tree(params), reference_params)
         params_ok = _check("params", param_stats)
         overall_ok = overall_ok and params_ok
         print(json.dumps({"step": step_idx, "component": "params", "ok": params_ok, **param_stats}))
+
+        if step_idx in watch_steps:
+            debug_root = step_dir / "soap_debug"
+            for name in watch_params:
+                reference_path = debug_root / f"{_param_slug(name)}.npz"
+                if not reference_path.exists() or name not in params or name not in opt_state:
+                    continue
+                debug_post_arrays, debug_post_meta = debug_post_state(params[name], opt_state[name])
+                debug_arrays = dict(debug_pre.get(name, {}))
+                debug_arrays.update(debug_post_arrays)
+                print(json.dumps({"step": step_idx, "component": "soap_debug_meta_post", "param": name, **debug_post_meta}))
+                _compare_debug_arrays(step_idx, name, debug_arrays, reference_path)
 
     return 0 if overall_ok else 1
 

@@ -59,6 +59,70 @@ def _is_active_matrix(matrix: jnp.ndarray | None) -> bool:
     return matrix is not None
 
 
+def _canonicalize_column_signs(mat: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    if mat.size == 0:
+        return mat
+    idx = jnp.argmax(jnp.abs(mat), axis=0)
+    signs = jnp.sign(mat[idx, jnp.arange(mat.shape[1])])
+    signs = jnp.where(signs == 0, 1.0, signs)
+    return mat * signs.reshape(1, -1)
+
+
+def _canonicalize_subspace(basis: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+    if basis.size == 0:
+        return basis
+    dim, width = basis.shape
+    eye = jnp.eye(dim, dtype=basis.dtype)
+    chosen: list[jnp.ndarray] = []
+
+    def orthogonalize(vec: jnp.ndarray) -> jnp.ndarray:
+        for prev in chosen:
+            vec = vec - prev * jnp.vdot(prev, vec)
+        return vec
+
+    for i in range(dim):
+        e = eye[:, i]
+        vec = basis @ (basis.T @ e)
+        vec = orthogonalize(vec)
+        norm = jnp.linalg.norm(vec)
+        if float(norm) > eps:
+            chosen.append(vec / norm)
+            if len(chosen) == width:
+                break
+
+    if len(chosen) < width:
+        for i in range(width):
+            vec = orthogonalize(basis[:, i])
+            norm = jnp.linalg.norm(vec)
+            if float(norm) > eps:
+                chosen.append(vec / norm)
+                if len(chosen) == width:
+                    break
+
+    if len(chosen) != width:
+        raise RuntimeError(f"Failed to canonicalize subspace of width {width}")
+
+    return _canonicalize_column_signs(jnp.stack(chosen, axis=1), eps=eps)
+
+
+def _canonicalize_eigenbasis(eigvals: jnp.ndarray, eigvecs: jnp.ndarray, group_rtol: float = 1e-5, eps: float = 1e-12) -> jnp.ndarray:
+    order = jnp.flip(jnp.argsort(eigvals, stable=True))
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
+    groups: list[tuple[int, int]] = []
+    start = 0
+    scale = max(float(jnp.max(jnp.abs(eigvals))) if eigvals.size > 0 else 0.0, 1.0)
+    threshold = group_rtol * scale
+    for idx in range(1, eigvals.shape[0] + 1):
+        if idx == eigvals.shape[0] or abs(float(eigvals[idx - 1]) - float(eigvals[idx])) > threshold:
+            groups.append((start, idx))
+            start = idx
+
+    canonical_groups = [_canonicalize_subspace(eigvecs[:, start:end], eps=eps) for start, end in groups]
+    return jnp.concatenate(canonical_groups, axis=1) if canonical_groups else eigvecs
+
+
 def init_preconditioner(grad: jnp.ndarray, hparams: SOAPHyperParams) -> dict:
     gg: list[jnp.ndarray | None] = []
     if grad.ndim == 1:
@@ -129,8 +193,8 @@ def get_orthogonal_matrix(gg: tuple[jnp.ndarray | None, ...]) -> tuple[jnp.ndarr
         if not _is_active_matrix(matrix):
             q_mats.append(_empty_like_torch_skip())
             continue
-        _, q = jnp.linalg.eigh(matrix + 1e-30 * jnp.eye(matrix.shape[0], dtype=matrix.dtype))
-        q_mats.append(jnp.flip(q, axis=1))
+        eigvals, q = jnp.linalg.eigh(matrix + 1e-30 * jnp.eye(matrix.shape[0], dtype=matrix.dtype))
+        q_mats.append(_canonicalize_eigenbasis(eigvals, q))
     return tuple(q_mats)
 
 
@@ -149,12 +213,13 @@ def get_orthogonal_matrix_qr(entry: dict, hparams: SOAPHyperParams) -> tuple[tup
             q_mats.append(_empty_like_torch_skip())
             continue
         est_eig = jnp.diag(orth.T @ matrix @ orth)
-        sort_idx = jnp.flip(jnp.argsort(est_eig))
+        sort_idx = jnp.flip(jnp.argsort(est_eig, stable=True))
         exp_avg_sq = jnp.take(exp_avg_sq, sort_idx, axis=idx)
+        est_eig = est_eig[sort_idx]
         orth = orth[:, sort_idx]
         power_iter = matrix @ orth
         q, _ = jnp.linalg.qr(power_iter)
-        q_mats.append(q)
+        q_mats.append(_canonicalize_eigenbasis(est_eig, q))
 
     if hparams.merge_dims:
         if hparams.data_format == "channels_last" and len(orig_shape) == 4:
@@ -162,6 +227,105 @@ def get_orthogonal_matrix_qr(entry: dict, hparams: SOAPHyperParams) -> tuple[tup
         else:
             exp_avg_sq = exp_avg_sq.reshape(orig_shape)
     return tuple(q_mats), exp_avg_sq
+
+
+def collect_matrix_arrays(prefix: str, mats: tuple[jnp.ndarray | None, ...] | None) -> tuple[dict[str, jnp.ndarray], list[int]]:
+    arrays: dict[str, jnp.ndarray] = {}
+    indices: list[int] = []
+    if mats is None:
+        return arrays, indices
+    for idx, mat in enumerate(mats):
+        if not _is_active_matrix(mat):
+            continue
+        arrays[f"{prefix}{idx}"] = mat
+        indices.append(idx)
+    return arrays, indices
+
+
+def debug_parameter_step(
+    param: jnp.ndarray,
+    grad: jnp.ndarray,
+    entry: dict,
+    hparams: SOAPHyperParams,
+) -> tuple[dict[str, jnp.ndarray], dict]:
+    arrays: dict[str, jnp.ndarray] = {
+        "param_before": param,
+        "grad": grad,
+    }
+    meta = {
+        "step_before": int(entry.get("step", 0)),
+        "had_q": bool(entry.get("Q") is not None),
+        "precondition_frequency": int(entry.get("precondition_frequency", hparams.precondition_frequency)),
+    }
+
+    gg_prev, gg_prev_indices = collect_matrix_arrays("gg_prev_", entry.get("GG"))
+    arrays.update(gg_prev)
+    meta["gg_prev_indices"] = gg_prev_indices
+
+    if entry.get("Q") is None:
+        return arrays, meta
+
+    q_prev, q_prev_indices = collect_matrix_arrays("q_prev_", entry["Q"])
+    arrays.update(q_prev)
+    meta["q_prev_indices"] = q_prev_indices
+
+    grad_projected = project(grad, entry, hparams)
+    beta1, beta2 = hparams.betas
+    step_num = int(entry["step"]) + 1
+    exp_avg_prev = entry["exp_avg"]
+    exp_avg_sq_prev = entry["exp_avg_sq"]
+    exp_avg_next = exp_avg_prev * beta1 + grad_projected * (1.0 - beta1)
+    exp_avg_sq_next = exp_avg_sq_prev * beta2 + jnp.square(grad_projected) * (1.0 - beta2)
+    denom = jnp.sqrt(exp_avg_sq_next) + hparams.eps
+
+    step_size = hparams.lr
+    if hparams.correct_bias:
+        bias_correction1 = 1.0 - beta1 ** step_num
+        bias_correction2 = 1.0 - beta2 ** step_num
+        step_size = step_size * (bias_correction2 ** 0.5) / bias_correction1
+
+    norm_grad = project_back(exp_avg_next / denom, entry, hparams)
+    if hparams.normalize_grads:
+        norm_grad = norm_grad / (1e-30 + jnp.sqrt(jnp.mean(jnp.square(norm_grad))))
+
+    param_after_formula = param - step_size * norm_grad
+    if hparams.weight_decay > 0.0:
+        param_after_formula = param_after_formula + (-hparams.lr * hparams.weight_decay) * param_after_formula
+
+    arrays.update({
+        "grad_projected": grad_projected,
+        "exp_avg_prev": exp_avg_prev,
+        "exp_avg_sq_prev": exp_avg_sq_prev,
+        "exp_avg_next": exp_avg_next,
+        "exp_avg_sq_next": exp_avg_sq_next,
+        "denom": denom,
+        "norm_grad": norm_grad,
+        "param_after_formula": param_after_formula,
+    })
+    meta["step_num"] = step_num
+    meta["step_size"] = float(step_size)
+    return arrays, meta
+
+
+def debug_post_state(param: jnp.ndarray, entry: dict) -> tuple[dict[str, jnp.ndarray], dict]:
+    arrays: dict[str, jnp.ndarray] = {
+        "param_after_actual": param,
+    }
+    meta = {
+        "step_after": int(entry.get("step", 0)),
+        "had_q_after": bool(entry.get("Q") is not None),
+    }
+    if "exp_avg" in entry:
+        arrays["exp_avg_post"] = entry["exp_avg"]
+    if "exp_avg_sq" in entry:
+        arrays["exp_avg_sq_post"] = entry["exp_avg_sq"]
+    gg_post, gg_post_indices = collect_matrix_arrays("gg_post_", entry.get("GG"))
+    arrays.update(gg_post)
+    meta["gg_post_indices"] = gg_post_indices
+    q_post, q_post_indices = collect_matrix_arrays("q_post_", entry.get("Q"))
+    arrays.update(q_post)
+    meta["q_post_indices"] = q_post_indices
+    return arrays, meta
 
 
 def update_preconditioner(grad: jnp.ndarray, entry: dict, hparams: SOAPHyperParams) -> dict:
