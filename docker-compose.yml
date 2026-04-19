@@ -2,9 +2,31 @@ services:
   backend:
     build:
       context: ./src
+      args:
+        CUDA_IMAGE: nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
     container_name: nika
     ports:
       - "6006:6006"
+    volumes:
+      - ./src:/app
+      - ./static:/app/static
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+  backend-jax13:
+    build:
+      context: ./src
+      args:
+        CUDA_IMAGE: nvidia/cuda:13.0.1-cudnn-runtime-ubuntu24.04
+    container_name: nika-jax13
+    ports:
+      - "6007:6006"
     volumes:
       - ./src:/app
       - ./static:/app/static

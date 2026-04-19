@@ -11,7 +11,8 @@ def load_video_frames(
     normalize=True,
 
 ):
-    torch.cuda.set_device(device)
+    if str(device).startswith("cuda"):
+        torch.cuda.set_device(device)
     all_paths = sorted(glob.glob(f"{dir_path}/*.png"))
     if not all_paths:
         raise RuntimeError(f"No frames found in {dir_path}")

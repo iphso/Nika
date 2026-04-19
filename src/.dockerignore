@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+models/
+visuals/
+error_plots/
+out_feature_test/
+
+*.torch
+*.npz
+*.png
+*.mp4
+*.zip

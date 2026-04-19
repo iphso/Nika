@@ -75,6 +75,78 @@ class SOAP(optim.Optimizer):
         }
         super().__init__(params, defaults)
         self._data_format = data_format
+
+    @staticmethod
+    def _canonicalize_column_signs(mat, eps=1e-12):
+        if mat.numel() == 0:
+            return mat
+        idx = torch.argmax(mat.abs(), dim=0)
+        signs = torch.sign(mat[idx, torch.arange(mat.shape[1], device=mat.device)])
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        return mat * signs.unsqueeze(0)
+
+    def _canonicalize_subspace(self, basis, eps=1e-12):
+        if basis.numel() == 0:
+            return basis
+        dim, width = basis.shape
+        dtype = basis.dtype
+        device = basis.device
+        eye = torch.eye(width, device=device, dtype=dtype)
+        chosen = []
+
+        def orthogonalize(vec):
+            if not chosen:
+                return vec
+            for _ in range(2):
+                for prev in chosen:
+                    vec = vec - prev * torch.dot(prev, vec)
+            return vec
+
+        for i in range(dim):
+            vec = basis[i, :]
+            vec = orthogonalize(vec)
+            norm = torch.linalg.vector_norm(vec)
+            if norm > eps:
+                chosen.append(vec / norm)
+                if len(chosen) == width:
+                    break
+
+        if len(chosen) < width:
+            for i in range(width):
+                vec = eye[:, i]
+                vec = orthogonalize(vec)
+                norm = torch.linalg.vector_norm(vec)
+                if norm > eps:
+                    chosen.append(vec / norm)
+                    if len(chosen) == width:
+                        break
+
+        if len(chosen) != width:
+            raise RuntimeError(f"Failed to canonicalize subspace of width {width}")
+
+        chosen_mat = torch.stack(chosen, dim=1)
+        rot, _ = torch.linalg.qr(chosen_mat)
+        rot = rot[:, :width].to(dtype)
+        return self._canonicalize_column_signs(basis @ rot, eps=eps)
+
+    def _canonicalize_eigenbasis(self, eigvals, eigvecs, group_rtol=1e-5, eps=1e-12):
+        order = torch.argsort(eigvals, descending=True, stable=True)
+        eigvals = eigvals.index_select(0, order)
+        eigvecs = eigvecs.index_select(1, order)
+
+        groups = []
+        start = 0
+        scale = max(float(eigvals[0].abs().item()) if eigvals.numel() > 0 else 0.0, 1.0)
+        threshold = group_rtol * scale
+        for idx in range(1, eigvals.shape[0] + 1):
+            if idx == eigvals.shape[0] or abs(float(eigvals[idx - 1].item()) - float(eigvals[idx].item())) > threshold:
+                groups.append((start, idx))
+                start = idx
+
+        canonical_groups = []
+        for start, end in groups:
+            canonical_groups.append(self._canonicalize_subspace(eigvecs[:, start:end], eps=eps))
+        return torch.cat(canonical_groups, dim=1) if canonical_groups else eigvecs
         
     def merge_dims(self, grad, max_precond_dim):
         """
@@ -358,11 +430,13 @@ class SOAP(optim.Optimizer):
                 final.append([])
                 continue
             try:
-                _, Q = torch.linalg.eigh(m+1e-30*torch.eye(m.shape[0], device=m.device))
+                eigvals, Q = torch.linalg.eigh(m+1e-30*torch.eye(m.shape[0], device=m.device))
             except:
-                _, Q = torch.linalg.eigh(m.to(torch.float64)+1e-30*torch.eye(m.shape[0], device=m.device))
+                eigvals, Q = torch.linalg.eigh(m.to(torch.float64)+1e-30*torch.eye(m.shape[0], device=m.device))
                 Q = Q.to(m.dtype)
-            Q = torch.flip(Q, [1])
+                eigvals = eigvals.to(m.dtype)
+
+            Q = self._canonicalize_eigenbasis(eigvals, Q)
 
             if not float_data:
                 Q = Q.to(original_device).type(original_type)
@@ -410,11 +484,13 @@ class SOAP(optim.Optimizer):
                 final.append([])
                 continue
             est_eig = torch.diag(o.T @ m @ o)
-            sort_idx = torch.argsort(est_eig, descending=True)
+            sort_idx = torch.argsort(est_eig, descending=True, stable=True)
             exp_avg_sq = exp_avg_sq.index_select(ind, sort_idx)
+            est_eig = est_eig.index_select(0, sort_idx)
             o = o[:,sort_idx]
             power_iter = m @ o
             Q, _ = torch.linalg.qr(power_iter)
+            Q = self._canonicalize_eigenbasis(est_eig, Q)
 
             if not float_data:
                 Q = Q.to(original_device).type(original_type)
