@@ -586,9 +586,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Nika feature test")
     parser.add_argument("--basedir", default="static/benchmarks", help="Base video directory")
     parser.add_argument("--name", default="bunny", help="Single video name")
-    parser.add_argument("--names", help="Comma-separated dataset names to run serially")
     parser.add_argument("--config", default="small", help="Config name from configs.REFERENCES")
-    parser.add_argument("--device", default="cuda:1", help="Device to run on, e.g. cuda:0 or 0")
+    parser.add_argument("--device", default="cuda:0", help="Device to run on, e.g. cuda:0 or 0")
     parser.add_argument("--batch_size", type=int, default=32, help="Initial training batch size")
     args = parser.parse_args()
 
@@ -599,19 +598,30 @@ if __name__ == "__main__":
         elif re.fullmatch(r"cuda\d+", device):
             device = device.replace('cuda', 'cuda:')
 
-    names = [args.name]
-    if args.names:
-        names = [n.strip() for n in args.names.split(",") if n.strip()]
-
     torch.manual_seed(42)
-    vid = load_video_frames(f"{args.basedir}/{dataset_name}", device, dtype=torch.uint8, normalize=False)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    feature_test(
-        vid,
-        dataset_name=args.name,
-        model_name=args.name.rpartition("/")[-1],
-        config=args.config,
-        device=device
+
+    all_names = [
+        "uvg/honey",
+        "uvg/bosphorus",
+        "uvg/beauty",
+        "uvg/jockey",
+        "uvg/ready",
+        "uvg/shake",
+        "uvg/yacht",
+    ]
+
+    if args.name == "all":
+        names = all_names
+    else:
+        names = [args.name]
+
+    run_all_feature_tests(
+        names,
+        args.basedir,
+        args.config,
+        device,
+        batch_size=args.batch_size,
     )
