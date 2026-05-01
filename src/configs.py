@@ -25,8 +25,8 @@ REFERENCES = {
     },
     "medium": {
         "grid_ranks": 8,
-        "real_tucker_ranks": [4, 90, 90, 70],
-        "complex_tucker_ranks": [4, 75, 75, 60],
+        "real_tucker_ranks": [3, 90, 90, 70],
+        "complex_tucker_ranks": [3, 75, 75, 60],
         "conv_hidden": 48,
         "operator_steps": 1,
         "op_hdim": 48,
@@ -34,7 +34,7 @@ REFERENCES = {
     "large": {
         "grid_ranks": 16,
         "real_tucker_ranks": [4, 100, 100, 100],
-        "complex_tucker_ranks": [4, 95, 95, 80],
+        "complex_tucker_ranks": [4, 80, 80, 80],
         "conv_hidden": 48,
         "operator_steps": 1,
         "op_hdim": 48,

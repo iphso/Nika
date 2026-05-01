@@ -474,7 +474,52 @@ class NikaBlock(nn.Module):
         return refined
 
 
-def feature_test(vid, dataset_name, model_name, config, device, batch_size=32):
+def split_segments(total_frames, num_segments):
+    if num_segments <= 1:
+        return [(0, total_frames)]
+
+    segment_size = math.ceil(total_frames / num_segments)
+    ranges = []
+    start = 0
+    while start < total_frames:
+        end = min(total_frames, start + segment_size)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+class MosaicNika(nn.Module):
+    def __init__(self, target_shape, k, model_kwargs, out_channels, device='cuda', num_segments=1):
+        super().__init__()
+        self.num_segments = max(1, num_segments)
+        self.segment_ranges = split_segments(target_shape[3], self.num_segments)
+
+        self.models = nn.ModuleList()
+        for start, end in self.segment_ranges:
+            seg_length = max(1, end - start)
+            seg_shape = [target_shape[0], target_shape[1], target_shape[2], seg_length]
+            self.models.append(
+                NikaBlock(
+                    target_shape=seg_shape,
+                    k=k,
+                    **model_kwargs,
+                    out_channels=out_channels,
+                    device=device,
+                )
+            )
+
+    def forward(self, norm_t, segment_id=0, **kwargs):
+        if self.num_segments == 1:
+            return self.models[0](norm_t, **kwargs)
+
+        if isinstance(segment_id, torch.Tensor):
+            segment_id = int(segment_id.item())
+        if not (0 <= segment_id < len(self.models)):
+            raise IndexError(f"segment_id {segment_id} out of range")
+        return self.models[segment_id](norm_t, **kwargs)
+
+
+def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, num_segments=1):
     base_name = os.path.basename(dataset_name)
     model_kwargs = REFERENCES[config]
     # copy and allow dataset-specific overrides
@@ -482,16 +527,36 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32):
     # double feature-grid channels for high-res 'bunny' dataset
     if base_name == 'bunny':
         model_kwargs['grid_ranks'] = model_kwargs['grid_ranks'] * 2
-    model = NikaBlock(
-        target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
-        k=4,
-        **model_kwargs,
-        out_channels=3,
-        device=device,
-    )
+
+    if num_segments > 1:
+        model = MosaicNika(
+            target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
+            k=4,
+            model_kwargs=model_kwargs,
+            out_channels=3,
+            device=device,
+            num_segments=num_segments,
+        )
+        segment_ranges = model.segment_ranges
+    else:
+        model = NikaBlock(
+            target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
+            k=4,
+            **model_kwargs,
+            out_channels=3,
+            device=device,
+        )
+        segment_ranges = [(0, vid.shape[0])]
 
     base_lr = 1e-2
-    basis_params = list(model.real_tucker.parameters()) + list(model.complex_tucker.parameters()) + list(model.grid_features.parameters())
+    if isinstance(model, MosaicNika):
+        basis_params = []
+        for sm in model.models:
+            basis_params.extend(list(sm.real_tucker.parameters()))
+            basis_params.extend(list(sm.complex_tucker.parameters()))
+            basis_params.extend(list(sm.grid_features.parameters()))
+    else:
+        basis_params = list(model.real_tucker.parameters()) + list(model.complex_tucker.parameters()) + list(model.grid_features.parameters())
     basis_ids = set(map(id, basis_params))
     rest_params = [p for p in model.parameters() if id(p) not in basis_ids]
     opt = SOAP([
@@ -520,20 +585,33 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32):
             opt.zero_grad(set_to_none=True)
             loss = 0.0
             start_time = time.time()
-            num_batches = (vid.shape[0] + current_batch_size - 1) // current_batch_size
-            for t in range(num_batches):
-                min_t = t * current_batch_size
-                max_t = min((t + 1) * current_batch_size, vid.shape[0])
-                batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
-                t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
-                norm_t_batch = t_batch.float() / (vid.shape[0] - 1)
-                prediction = model(norm_t_batch)
-                mse = F.mse_loss(prediction, batch_gt)
-                psnr = -10.0 * torch.log10(mse + 1e-8)
+            for segment_id, (seg_start, seg_end) in enumerate(segment_ranges):
+                segment_length = seg_end - seg_start
+                if segment_length == 0:
+                    continue
 
-                frame_loss = (-psnr) * (batch_gt.shape[0] / vid.shape[0])  # weight by number of frames in batch
-                frame_loss.backward()
-                loss += frame_loss
+                num_batches = (segment_length + current_batch_size - 1) // current_batch_size
+                for t in range(num_batches):
+                    min_t = seg_start + t * current_batch_size
+                    max_t = min(seg_start + (t + 1) * current_batch_size, seg_end)
+                    batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
+                    t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
+                    if segment_length > 1:
+                        norm_t_batch = (t_batch - seg_start).float() / (segment_length - 1)
+                    else:
+                        norm_t_batch = torch.zeros_like(t_batch, dtype=torch.float32)
+
+                    if num_segments > 1:
+                        prediction = model(norm_t_batch, segment_id=segment_id)
+                    else:
+                        prediction = model(norm_t_batch)
+
+                    mse = F.mse_loss(prediction, batch_gt)
+                    psnr = -10.0 * torch.log10(mse + 1e-8)
+
+                    frame_loss = (-psnr) * (batch_gt.shape[0] / vid.shape[0])  # weight by number of frames in batch
+                    frame_loss.backward()
+                    loss += frame_loss
             average_frame_time = (time.time() - start_time) / vid.shape[0]
             epoch_psnr = -loss.item()
             print(f"[{dataset_name}] Epoch {epoch} loss: {loss.item():.4f}, time: {average_frame_time:.5f}s, PSNR: {epoch_psnr:.2f}")
@@ -567,7 +645,7 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32):
     print(f"Best PSNR achieved: {best_psnr:.2f} at epoch {best_epoch}")
 
 
-def run_all_feature_tests(names, basedir, config, device, batch_size=32):
+def run_all_feature_tests(names, basedir, config, device, batch_size=32, num_segments=1):
     for dataset_name in names:
         print(f"\n=== Starting dataset: {dataset_name} ===")
         vid = load_video_frames(f"{basedir}/{dataset_name}", device, dtype=torch.uint8, normalize=False)
@@ -579,6 +657,7 @@ def run_all_feature_tests(names, basedir, config, device, batch_size=32):
             config=config,
             device=device,
             batch_size=batch_size,
+            num_segments=num_segments,
         )
 
 
@@ -589,6 +668,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", default="small", help="Config name from configs.REFERENCES")
     parser.add_argument("--device", default="cuda:0", help="Device to run on, e.g. cuda:0 or 0")
     parser.add_argument("--batch_size", type=int, default=32, help="Initial training batch size")
+    parser.add_argument("--segments", type=int, default=1, help="Number of temporal model shards for mosaic mode")
     args = parser.parse_args()
 
     device = args.device
@@ -624,4 +704,5 @@ if __name__ == "__main__":
         args.config,
         device,
         batch_size=args.batch_size,
+        num_segments=args.segments,
     )
