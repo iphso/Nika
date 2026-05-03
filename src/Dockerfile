@@ -29,6 +29,7 @@ RUN pip install numpy \
                 opencv-python \
                 imageio[ffmpeg] \
                 imageio-ffmpeg \
-                scikit-video
+                scikit-video \
+                fvcore
 
 EXPOSE 6006

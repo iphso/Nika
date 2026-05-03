@@ -315,16 +315,12 @@ class NikaBlock(nn.Module):
             ranks=real_tucker_ranks,
             device=device,
         )
-        if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
-            self.real_tucker = torch.compile(self.real_tucker)
 
         self.grid_features = FeatureGrid(
             target_shape=self.internal_shape,
             grid_res=grid_ranks,
             device=device,
         )
-        if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
-            self.grid_features = torch.compile(self.grid_features)
 
         self.complex_tucker = ComplexTucker(
             target_shape=self.internal_shape,
@@ -336,9 +332,6 @@ class NikaBlock(nn.Module):
         self.n_heads = 3
 
         self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
-        if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
-            self.groupnorm = torch.compile(self.groupnorm)
-
         self.operator_steps = operator_steps
 
         self.forward_operators = nn.ModuleList()
@@ -356,12 +349,8 @@ class NikaBlock(nn.Module):
                 h_dim = op_hdim,
                 device = device,
             )
-            if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
-                self.forward_operators.append(torch.compile(fwd))
-                self.backward_operators.append(torch.compile(bwd))
-            else:
-                self.forward_operators.append(fwd)
-                self.backward_operators.append(bwd)
+            self.forward_operators.append(fwd)
+            self.backward_operators.append(bwd)
 
         self.upres = BasicUpres(
             in_channels = self.n_heads * self.C,
@@ -370,8 +359,6 @@ class NikaBlock(nn.Module):
             k = k,    
             device = device,
         )
-        if os.environ.get('NIKA_USE_TORCH_COMPILE', '1') == '1':
-            self.upres = torch.compile(self.upres)
 
         self.log_stats()
 
@@ -492,31 +479,67 @@ class MosaicNika(nn.Module):
     def __init__(self, target_shape, k, model_kwargs, out_channels, device='cuda', num_segments=1):
         super().__init__()
         self.num_segments = max(1, num_segments)
-        self.segment_ranges = split_segments(target_shape[3], self.num_segments)
+        self.total_frames = target_shape[3]
+        self.segment_ranges = split_segments(self.total_frames, self.num_segments)
 
         self.models = nn.ModuleList()
         for start, end in self.segment_ranges:
             seg_length = max(1, end - start)
             seg_shape = [target_shape[0], target_shape[1], target_shape[2], seg_length]
-            self.models.append(
-                NikaBlock(
-                    target_shape=seg_shape,
-                    k=k,
-                    **model_kwargs,
-                    out_channels=out_channels,
-                    device=device,
-                )
+            model = NikaBlock(
+                target_shape=seg_shape,
+                k=k,
+                **model_kwargs,
+                out_channels=out_channels,
+                device=device,
             )
+            self.models.append(model)
 
-    def forward(self, norm_t, segment_id=0, **kwargs):
+        total_params = sum(sum(p.numel() for p in model.parameters()) for model in self.models)
+        print(f"MosaicNika: {len(self.models)} segments, total params: {total_params / 1e6:.3f}M")
+
+    def forward(self, norm_t, **kwargs):
         if self.num_segments == 1:
             return self.models[0](norm_t, **kwargs)
 
-        if isinstance(segment_id, torch.Tensor):
-            segment_id = int(segment_id.item())
-        if not (0 <= segment_id < len(self.models)):
-            raise IndexError(f"segment_id {segment_id} out of range")
-        return self.models[segment_id](norm_t, **kwargs)
+        if not isinstance(norm_t, torch.Tensor):
+            norm_t = torch.tensor([norm_t], device=self.models[0].grid_features.grid.device, dtype=torch.float32)
+        norm_t = norm_t.view(-1)
+
+        positions = (norm_t * max(self.total_frames - 1, 1)).clamp(0.0, self.total_frames - 1)
+        frame_ids = (positions + 1e-4).floor().long().clamp(0, self.total_frames - 1)
+
+        # Fast-path when all requested frames belong to one contiguous mosaic segment.
+        for segment_id, (seg_start, seg_end) in enumerate(self.segment_ranges):
+            if frame_ids.numel() > 0 and frame_ids.min() >= seg_start and frame_ids.max() < seg_end:
+                local_norm = (positions - seg_start) / max(seg_end - seg_start - 1, 1)
+                return self.models[segment_id](local_norm, **kwargs)
+
+        outputs = None
+        for segment_id, (seg_start, seg_end) in enumerate(self.segment_ranges):
+            mask = (frame_ids >= seg_start) & (frame_ids < seg_end)
+            if not mask.any():
+                continue
+
+            seg_positions = positions[mask] - seg_start
+            seg_length = seg_end - seg_start
+            local_norm = (seg_positions / max(seg_length - 1, 1)).clamp(0.0, 1.0)
+            segment_out = self.models[segment_id](local_norm, **kwargs)
+            if segment_out.ndim == 3:
+                segment_out = segment_out.unsqueeze(0)
+
+            if outputs is None:
+                outputs = torch.empty(
+                    (frame_ids.shape[0],) + segment_out.shape[1:],
+                    device=segment_out.device,
+                    dtype=segment_out.dtype,
+                )
+
+            outputs[mask] = segment_out
+
+        if outputs is None:
+            return torch.empty((0, 3, self.models[0].grid_features.grid.shape[1], self.models[0].grid_features.grid.shape[2]), device=self.models[0].grid_features.grid.device)
+        return outputs
 
 
 def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, num_segments=1):
@@ -528,35 +551,27 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
     if base_name == 'bunny':
         model_kwargs['grid_ranks'] = model_kwargs['grid_ranks'] * 2
 
-    if num_segments > 1:
-        model = MosaicNika(
-            target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
-            k=4,
-            model_kwargs=model_kwargs,
-            out_channels=3,
-            device=device,
-            num_segments=num_segments,
-        )
-        segment_ranges = model.segment_ranges
-    else:
-        model = NikaBlock(
-            target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
-            k=4,
-            **model_kwargs,
-            out_channels=3,
-            device=device,
-        )
-        segment_ranges = [(0, vid.shape[0])]
+    config_segments = model_kwargs.pop('num_segments', 1)
+    if num_segments == 1:
+        num_segments = config_segments
+    num_segments = max(1, int(num_segments))
+
+    model = MosaicNika(
+        target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
+        k=4,
+        model_kwargs=model_kwargs,
+        out_channels=3,
+        device=device,
+        num_segments=num_segments,
+    )
+    segment_ranges = model.segment_ranges
 
     base_lr = 1e-2
-    if isinstance(model, MosaicNika):
-        basis_params = []
-        for sm in model.models:
-            basis_params.extend(list(sm.real_tucker.parameters()))
-            basis_params.extend(list(sm.complex_tucker.parameters()))
-            basis_params.extend(list(sm.grid_features.parameters()))
-    else:
-        basis_params = list(model.real_tucker.parameters()) + list(model.complex_tucker.parameters()) + list(model.grid_features.parameters())
+    basis_params = []
+    for sm in model.models:
+        basis_params.extend(list(sm.real_tucker.parameters()))
+        basis_params.extend(list(sm.complex_tucker.parameters()))
+        basis_params.extend(list(sm.grid_features.parameters()))
     basis_ids = set(map(id, basis_params))
     rest_params = [p for p in model.parameters() if id(p) not in basis_ids]
     opt = SOAP([
@@ -572,7 +587,7 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
         threshold = 0.015,
         threshold_mode='abs',
         cooldown=20,
-        min_lr=1e-3,
+        min_lr=2e-3,
     )
 
     best_psnr = float('-inf')
@@ -596,15 +611,9 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
                     max_t = min(seg_start + (t + 1) * current_batch_size, seg_end)
                     batch_gt = vid[min_t:max_t].to(torch.float32) / 255.0
                     t_batch = torch.arange(min_t, max_t, device=device, dtype=torch.int64)
-                    if segment_length > 1:
-                        norm_t_batch = (t_batch - seg_start).float() / (segment_length - 1)
-                    else:
-                        norm_t_batch = torch.zeros_like(t_batch, dtype=torch.float32)
+                    norm_t_batch = t_batch.float() / max(vid.shape[0] - 1, 1)
 
-                    if num_segments > 1:
-                        prediction = model(norm_t_batch, segment_id=segment_id)
-                    else:
-                        prediction = model(norm_t_batch)
+                    prediction = model(norm_t_batch)
 
                     mse = F.mse_loss(prediction, batch_gt)
                     psnr = -10.0 * torch.log10(mse + 1e-8)
@@ -687,9 +696,9 @@ if __name__ == "__main__":
         "uvg/honey",
         "uvg/bosphorus",
         "uvg/beauty",
-        "uvg/jockey",
+        # "uvg/jockey",
         "uvg/ready",
-        "uvg/shake",
+        # "uvg/shake",
         "uvg/yacht",
     ]
 
