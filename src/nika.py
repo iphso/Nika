@@ -750,7 +750,7 @@ def run_all_feature_tests(names, basedir, config, device, batch_size=32, num_seg
     for dataset_name in names:
         print(f"\n=== Starting dataset: {dataset_name} ===")
         vid = load_video_frames(f"{basedir}/{dataset_name}", device, dtype=torch.uint8, normalize=False)
-        torch.manual_seed(42)
+        torch.manual_seed(45)
         feature_test(
             vid,
             dataset_name=dataset_name,
