@@ -8,6 +8,7 @@ services:
     volumes:
       - ./src:/app
       - ./static:/app/static
+      - ${KUMA_PATH}:/kuma
     deploy:
       resources:
         reservations:
@@ -17,3 +18,4 @@ services:
               capabilities: [gpu]
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONPATH=/kuma/src

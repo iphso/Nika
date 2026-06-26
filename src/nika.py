@@ -1,5 +1,4 @@
 import argparse
-import re
 import os
 import time
 import math
@@ -21,6 +20,7 @@ import random
 from load_data import load_video_frames
 from encoding_utils import FourierEncoding
 from configs import REFERENCES
+from run_utils import add_common_args, resolve_device, setup_torch
 
 
 class TuckerFactor(nn.Module):
@@ -59,7 +59,6 @@ class TuckerFactor(nn.Module):
     def get(self, target):
         U = self.forward()
         target = torch.as_tensor(target, device=U.device, dtype=torch.float32).view(-1)
-        # clamp to [0,1]
         target = target.clamp(0.0, 1.0)
 
         # continuous positions in [0, D-1]
@@ -69,22 +68,104 @@ class TuckerFactor(nn.Module):
         idx1 = (idx0 + 1).clamp(max=D - 1)
         w = (pos - idx0.float()).unsqueeze(-1)  # [B,1]
 
-        if torch.is_complex(U):
-            real = U.real
-            imag = U.imag
-            s0_r = real[idx0]
-            s1_r = real[idx1]
-            s0_i = imag[idx0]
-            s1_i = imag[idx1]
-            out_r = (1.0 - w) * s0_r + w * s1_r
-            out_i = (1.0 - w) * s0_i + w * s1_i
-            return torch.complex(out_r, out_i)
+        return (1.0 - w) * U[idx0] + w * U[idx1]
 
-        # real case
-        s0 = U[idx0]
-        s1 = U[idx1]
-        out = (1.0 - w) * s0 + w * s1
-        return out
+
+class ModulatedTuckerFactor(TuckerFactor):
+    def __init__(
+        self,
+        target_dim,
+        rank,
+        bank_size,
+        encoding_len,
+        h_dim,
+        is_complex=False,
+        base_mag=1e-2,
+        device='cuda',
+    ):
+        super().__init__(
+            target_dim = bank_size,
+            rank = rank,
+            is_complex = is_complex,
+            base_mag = base_mag,
+            device = device,
+        )
+
+        self.output_size = target_dim
+        self.bank_size = bank_size
+        self.encoding_len = encoding_len
+
+        # Gaussian sliding-window prior: position h's natural bank index slides
+        # from h (t=0) to h+slack (t=1). sigma is learnable so training can
+        # loosen/tighten the window instead of discovering locality from scratch.
+        slack = max(bank_size - target_dim, 1)
+        self.log_sigma = nn.Parameter(torch.tensor(math.log(slack / 4.0), device=device))
+
+        self.target_pos = nn.Parameter(
+            torch.randn(target_dim, encoding_len, device=device) * base_mag
+        ).to(device)
+        self.bank_pos = nn.Parameter(
+            torch.randn(bank_size, encoding_len, device=device) * base_mag
+        ).to(device)
+
+        self.time_encoder = FourierEncoding(encoding_len, max_freq=encoding_len // 2, freq_init="log", device=device)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(encoding_len, h_dim),
+            nn.GELU(),
+            nn.Linear(h_dim, encoding_len),
+        ).to(device)
+
+        self.q_proj = nn.Linear(encoding_len, encoding_len).to(device)
+        self.k_proj = nn.Linear(encoding_len, encoding_len).to(device)
+    
+    def forward(self, t):
+        t = torch.as_tensor(t, device=self.target_pos.device, dtype=torch.float32).view(-1)
+        bank = super().forward()
+        # _col_norm (inherited) normalizes columns to unit norm over bank_size rows, so
+        # per-row magnitude shrinks as ~1/sqrt(bank_size). Rescale back to the canonical
+        # output_size budget so growing the bank doesn't dilute the signal.
+        bank = bank * math.sqrt(self.bank_size / self.output_size)
+
+        time_emb = self.time_encoder(t)  # [B, encoding_len]
+        time_emb = self.time_mlp(time_emb) * 1e-2  # [B, encoding_len]
+
+        q = self.target_pos[None, ...] + time_emb[:, None, :]
+        k = self.bank_pos[None, ...]
+
+        q = self.q_proj(q)
+        k = self.k_proj(k)
+
+        attn_scores = torch.einsum("bte,bue->btu", q, k) / math.sqrt(q.shape[-1])  # [B, target_dim, bank_size]
+
+        slack = self.bank_size - self.output_size
+        h_idx = torch.arange(self.output_size, device=t.device, dtype=torch.float32)
+        u_idx = torch.arange(self.bank_size, device=t.device, dtype=torch.float32)
+        center = h_idx[None, :] + t[:, None] * slack  # [B, target_dim]
+        dist2 = (center[:, :, None] - u_idx[None, None, :]) ** 2  # [B, target_dim, bank_size]
+        sigma = self.log_sigma.exp()
+        attn_scores = attn_scores - dist2 / (2 * sigma ** 2 + 1e-6)
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, target_dim, bank_size]
+
+        if torch.is_complex(bank):
+            factors_real = torch.einsum("btu,ur->btr", attn_weights, bank.real)
+            factors_imag = torch.einsum("btu,ur->btr", attn_weights, bank.imag)
+            factors = torch.complex(factors_real, factors_imag)
+        else:
+            factors = torch.einsum("btu,ur->btr", attn_weights, bank)  # [B, target_dim, rank]
+        return factors
+    
+    def get(self, t, target):
+        U = self.forward(t)
+        target = torch.as_tensor(target, device=U.device, dtype=torch.float32).view(-1).clamp(0.0, 1.0)
+        pos = target * (self.output_size - 1)
+
+        idx0 = pos.floor().long()
+        idx1 = (idx0 + 1).clamp(max=self.output_size - 1)
+        w = (pos - idx0.float()).unsqueeze(-1)  # [B,1]
+
+        batch_idx = torch.arange(U.shape[0], device=U.device)
+        return (1.0 - w) * U[batch_idx, idx0] + w * U[batch_idx, idx1]
 
 
 class RealTucker(nn.Module):
@@ -97,6 +178,10 @@ class RealTucker(nn.Module):
         self.UW = TuckerFactor(self.W, self.rW, is_complex=False, device=device)
         self.UC = TuckerFactor(self.C, self.rC, is_complex=False, device=device)
         self.UT = TuckerFactor(self.T, self.rT, is_complex=False, device=device)
+        # self.UH = ModulatedTuckerFactor(self.H, self.rH, bank_size=self.H * 2, encoding_len=128, h_dim=64, is_complex=False, device=device)
+        # self.UW = ModulatedTuckerFactor(self.W, self.rW, bank_size=self.W * 2, encoding_len=128, h_dim=64, is_complex=False, device=device)
+        # self.UC = ModulatedTuckerFactor(self.C, self.rC, bank_size=self.C * 2, encoding_len=128, h_dim=64, is_complex=False, device=device)
+        # self.UT = ModulatedTuckerFactor(self.T, self.rT, bank_size=self.T * 2, encoding_len=128, h_dim=64, is_complex=False, device=device)
 
         self.G = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
 
@@ -125,6 +210,11 @@ class ComplexTucker(RealTucker):
             self.UW = TuckerFactor(half_W, self.rW, is_complex=True, device=device)
             self.UC = TuckerFactor(self.C, self.rC, is_complex=True, device=device)
             self.UT = TuckerFactor(self.T, self.rT, is_complex=True, device=device)
+
+            # self.UH = ModulatedTuckerFactor(self.H, self.rH, bank_size=self.H * 2, encoding_len=128, h_dim=64, is_complex=True, device=device)
+            # self.UW = ModulatedTuckerFactor(half_W, self.rW, bank_size=half_W * 2, encoding_len=128, h_dim=64, is_complex=True, device=device)
+            # self.UC = ModulatedTuckerFactor(self.C, self.rC, bank_size=self.C * 2, encoding_len=128, h_dim=64, is_complex=True, device=device)
+            # self.UT = ModulatedTuckerFactor(self.T, self.rT, bank_size=self.T * 2, encoding_len=128, h_dim=64, is_complex=True, device=device)
 
             self.G = None  # override parent
             self.G_real = nn.Parameter(torch.randn(self.rT, self.rC, self.rH, self.rW, device=device) * 1e-2)
@@ -170,15 +260,6 @@ class ComplexTucker(RealTucker):
         return real_tucker.contiguous()
 
 
-def grid_sample_base(H, W, device):
-    y_lin = torch.arange(0, H, device=device)
-    x_lin = torch.arange(0, W, device=device)
-    y_norm = 2.0 * (y_lin / (H - 1)) - 1.0
-    x_norm = 2.0 * (x_lin / (W - 1)) - 1.0
-    y, x = torch.meshgrid(y_norm, x_norm, indexing='ij')  # [H, W]
-    return torch.stack((x, y), dim=-1)  # [H, W, 2]
-
-
 class FeatureGrid(nn.Module):
     def __init__(self, target_shape, grid_res, zero_init=False, device="cuda"):
         super().__init__()
@@ -195,11 +276,6 @@ class FeatureGrid(nn.Module):
             self.channel_proj = nn.Linear(self.grid_c, self.C, bias=True).to(device)
             nn.init.normal_(self.channel_proj.weight, mean=0.0, std=0.02)
             nn.init.zeros_(self.channel_proj.bias)
-        self.register_buffer(
-            "_xy_base",
-            grid_sample_base(self.H, self.W, device=device),
-            persistent=False
-        )
 
         self._grid_5d_view = None
     
@@ -218,7 +294,19 @@ class FeatureGrid(nn.Module):
 
 
 def tucker_construct(UT, UC, UH, UW, G):
-    return torch.einsum('ijkl,ti,cj,hk,wl->tchw', G, UT, UC, UH, UW)
+    """UT is always per-sample [B, rT]. UC/UH/UW may each be static [dim, rank]
+    (plain TuckerFactor) or per-sample [B, dim, rank] (ModulatedTuckerFactor);
+    broadcast whichever ones are static so the einsum below always sees batched
+    tensors for all three."""
+    B = UT.shape[0]
+    if UC.dim() == 2:
+        UC = UC.unsqueeze(0).expand(B, -1, -1)
+    if UH.dim() == 2:
+        UH = UH.unsqueeze(0).expand(B, -1, -1)
+    if UW.dim() == 2:
+        UW = UW.unsqueeze(0).expand(B, -1, -1)
+
+    return torch.einsum('ijkl,ti,tcj,thk,twl->tchw', G, UT, UC, UH, UW)
 
 
 class ConvNeXtBlock(nn.Module):
@@ -290,7 +378,7 @@ class ConvOperator(nn.Module):
 
         self.encoding = FourierEncoding(
             target_dim=encoding_len,
-            max_freq=64,
+            max_freq=encoding_len // 2,
             freq_init="log",
             device=device
         )
@@ -332,13 +420,15 @@ class NikaBlock(nn.Module):
         op_hdim,
         device,
         complex_grid_ranks=None,
-        use_compile=False
+        use_compile=False,
+        accept_sidecar=False,
     ):
         super().__init__()
         self.C, self.H, self.W, T = target_shape
         self.orig_T = T
         self.T = T + (operator_steps * 2)  # Virtual padding
-        self.H = int(self.H // k); self.W = int(self.W // k)
+        self.target_h, self.target_w = self.H, self.W
+        self.H = math.ceil(self.H / k); self.W = math.ceil(self.W / k)
         self.internal_shape = [self.C, self.H, self.W, self.T]  # extra time steps for operator predictions
         self.dT = 1.0 / (self.T - 1)
         self.n_heads = 0
@@ -373,6 +463,11 @@ class NikaBlock(nn.Module):
             )
             self.n_heads += 1
             self._head_order.append('complex')
+        
+        self.accept_sidecar = accept_sidecar
+        if self.accept_sidecar:
+            self.n_heads += 1
+            self._head_order.append('sidecar')
 
         self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
         self.operator_steps = operator_steps
@@ -389,6 +484,7 @@ class NikaBlock(nn.Module):
 
         self.forward_operators = nn.ModuleList()
         self.backward_operators = nn.ModuleList()
+
         for _ in range(self.operator_steps):
             fwd = ConvOperator(
                 in_channels = 2 * self.n_heads * self.C,
@@ -444,8 +540,8 @@ class NikaBlock(nn.Module):
             total_params += upres_params
         print(f"  Total:           {total_params / 1e6:.3f}M")
 
-    def forward(self, norm_t, noise_op=None, zero_real_tucker=False, zero_feature_grid=False, zero_complex_tucker=False, zero_complex_grid=False, return_operators=False):
-        if type(norm_t) is not torch.Tensor:
+    def forward(self, norm_t, noise_op=None, zero_real_tucker=False, zero_feature_grid=False, zero_complex_tucker=False, zero_complex_grid=False, return_operators=False, sidecar=None):
+        if not isinstance(norm_t, torch.Tensor):
             norm_t = torch.tensor([norm_t], device=self.grid_features.grid.device, dtype=torch.float32)
 
         norm_t = (norm_t * (self.orig_T - 1) + float(self.operator_steps)) * self.dT
@@ -482,6 +578,9 @@ class NikaBlock(nn.Module):
             comps['complex'] = complex_all.view(B, 2 * S + 1, self.C, self.H, self.W)
         else:
             comps['complex'] = zero_base.unsqueeze(1).expand(B, 2 * S + 1, -1, -1, -1)
+        
+        if hasattr(self, 'accept_sidecar') and self.accept_sidecar:
+            comps['sidecar'] = sidecar.unsqueeze(1).expand(B, 2 * S + 1, -1, -1, -1)
 
         # Build concatenation in the same order heads were created so GroupNorm groups
         parts = [comps[name] for name in getattr(self, '_head_order', ['grid', 'real', 'complex'])]
@@ -516,6 +615,9 @@ class NikaBlock(nn.Module):
 
         aggregated = current_input + operator_residual
         refined = self.upres(aggregated)
+
+        # slice of padding
+        refined = refined[..., :self.target_h, :self.target_w]
 
         if return_operators:
             refined_forward = self.upres(forward_prediction)
@@ -630,7 +732,6 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
     if base_name == 'bunny':
         model_kwargs['grid_ranks'] = model_kwargs['grid_ranks'] * 2
 
-    # extract config default for segments and use CLI override if provided
     config_segments = model_kwargs.pop('num_segments', 1)
     if num_segments is None:
         num_segments = int(config_segments)
@@ -765,26 +866,12 @@ def run_all_feature_tests(names, basedir, config, device, batch_size=32, num_seg
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Nika feature test")
-    parser.add_argument("--basedir", default="static/benchmarks", help="Base video directory")
-    parser.add_argument("--name", default="bunny", help="Single video name")
-    parser.add_argument("--config", default="small", help="Config name from configs.REFERENCES")
-    parser.add_argument("--device", default="cuda:0", help="Device to run on, e.g. cuda:0 or 0")
-    parser.add_argument("--batch_size", type=int, default=32, help="Initial training batch size")
+    add_common_args(parser)
     parser.add_argument("--segments", type=int, default=None, help="Number of temporal model shards for mosaic mode (overrides config)")
-    parser.add_argument("--operator_steps", type=int, default=None, help="Number of operator steps (overrides config)")
     args = parser.parse_args()
 
-    device = args.device
-    if isinstance(device, str):
-        if re.fullmatch(r"\d+", device):
-            device = f"cuda:{device}"
-        elif re.fullmatch(r"cuda\d+", device):
-            device = device.replace('cuda', 'cuda:')
-
-    torch.manual_seed(42)
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    device = resolve_device(args.device)
+    setup_torch()
 
     all_names = [
         "uvg/honey",
