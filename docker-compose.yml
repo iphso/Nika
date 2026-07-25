@@ -8,6 +8,7 @@ services:
     volumes:
       - ./src:/app
       - ./static:/app/static
+      - /root/datasets/bigbuckbunny/frames:/app/static/benchmarks/bunny:ro
     deploy:
       resources:
         reservations:
