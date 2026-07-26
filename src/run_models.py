@@ -23,15 +23,25 @@ except Exception:
     FlopCounterMode = None
 
 
-def get_best_model(model_dir, vid_shape, vid_name, config, device):
+def get_best_model(model_dir, vid_shape, vid_name, config, device, checkpoint_path=None):
     model_vid = os.path.basename(vid_name)
-    candidates = glob.glob(f"{model_dir}/{config}-{model_vid}-*.torch")
 
     def extract_psnr(path):
         match = re.search(r'psnr([0-9]+(?:\.[0-9]+)?)', path)
         if match:
             return float(match.group(1))
         return float('-inf')
+
+    if checkpoint_path is not None:
+        # Explicit checkpoint (e.g. a wall-clock-mark snapshot named "*-<N>min.torch" rather than
+        # "*-epoch<N>-psnr<P>.torch") -- skip the psnr-sorted glob discovery below entirely.
+        model_path = checkpoint_path
+        actual_config = config
+        print(f"Using explicit checkpoint for {vid_name} with config {config}: {model_path}")
+        model_kwargs = dict(REFERENCES[actual_config])
+        return _load_model_from_path(model_path, model_kwargs, vid_shape, device)
+
+    candidates = glob.glob(f"{model_dir}/{config}-{model_vid}-*.torch")
 
     actual_config = config
     if not candidates:
@@ -53,8 +63,14 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
         print(f"Best model for {vid_name} with config {config}: {model_path}")
 
     model_kwargs = dict(REFERENCES[actual_config])
+    return _load_model_from_path(model_path, model_kwargs, vid_shape, device,
+                                  is_bunny=(os.path.basename(vid_name) == 'bunny'))
+
+
+def _load_model_from_path(model_path, model_kwargs, vid_shape, device, is_bunny=True):
+    model_kwargs = dict(model_kwargs)
     num_segments = model_kwargs.pop('num_segments', 1)
-    if os.path.basename(vid_name) == 'bunny' and 'grid_ranks' in model_kwargs:
+    if is_bunny and 'grid_ranks' in model_kwargs:
         model_kwargs['grid_ranks'] = model_kwargs['grid_ranks'] * 2
 
     model = MosaicNika(
@@ -82,7 +98,7 @@ def get_best_model(model_dir, vid_shape, vid_name, config, device):
     return model
 
 
-def force_head_order(model, order=('grid', 'real', 'complex')):
+def force_head_order(model, order=('real', 'grid', 'complex')):
     for m in getattr(model, "models", []):
         existing = set(getattr(m, "_head_order", []))
         m._head_order = [x for x in order if x in existing]
@@ -520,6 +536,8 @@ def main():
     parser.add_argument("--config", default="large", help="Config name from configs.REFERENCES")
     parser.add_argument("--device", default="cuda:0", help="Device to run on, e.g. cuda:0 or cpu")
     parser.add_argument("--model_dir", default="models/ref_models/large", help="Directory containing reference model checkpoints")
+    parser.add_argument("--checkpoint", default=None, help="Explicit checkpoint path, bypassing best-by-psnr auto-discovery in model_dir")
+    parser.add_argument("--psnr_only", action="store_true", help="Skip torch.compile and the decode/encode FPS benchmarking loops (30+ full-video forward passes); just load the checkpoint and measure PSNR")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for decode/PSNR measurement")
     parser.add_argument("--no-compile-model", action="store_true", help="Disable whole-model compilation for inference")
     parser.add_argument("--debug_psnr", action="store_true", help="Print per-frame PSNR values during decode evaluation")
@@ -553,10 +571,11 @@ def main():
         return
 
     vid = load_video_frames(f"{args.basedir}/{args.name}", device, dtype=torch.uint8, normalize=False)
-    model = get_best_model(args.model_dir, vid.shape, args.name, args.config, device)
+    model = get_best_model(args.model_dir, vid.shape, args.name, args.config, device,
+                            checkpoint_path=args.checkpoint)
     force_head_order(model)
 
-    compile_model = not args.no_compile_model
+    compile_model = not args.no_compile_model and not args.psnr_only
     if compile_model:
         try:
             model = torch.compile(model)
@@ -569,14 +588,24 @@ def main():
         except Exception as exc:
             print(f"Warning: torch.compile failed for whole model: {exc}")
 
+    if args.psnr_only:
+        psnr = measure_psnr(model, vid, device, batch_size=args.batch_size, debug_psnr=args.debug_psnr)
+        print(f"Clamped PSNR: {psnr:.4f}")
+        return
+
     macs = compute_macs(model, device)
 
     warmup_model(model, vid.shape[0], device, batch_size=args.batch_size)
+    if 'cuda' in device:
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
     decode_fps = measure_decode_fps(model, vid.shape[0], device, batch_size=args.batch_size)
+    decode_peak_mem = torch.cuda.max_memory_allocated(device) if 'cuda' in device else None
     psnr = measure_psnr(model, vid, device, batch_size=args.batch_size, debug_psnr=args.debug_psnr)
     encode_fps = measure_encode_fps(model, vid, device, batch_size=args.batch_size, compile_model=compile_model)
 
     print(f"Decode FPS: {decode_fps:.2f}")
+    print(f"Decode Peak Mem (MiB): {decode_peak_mem / (1024**2):.1f}" if decode_peak_mem is not None else "Decode Peak Mem (MiB): n/a")
     print(f"Encode FPS: {encode_fps:.2f}")
     print(f"MACs: {macs:.2f}")
     print(f"Clamped PSNR: {psnr:.4f}")
