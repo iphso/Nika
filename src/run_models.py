@@ -538,6 +538,7 @@ def main():
     parser.add_argument("--model_dir", default="models/ref_models/large", help="Directory containing reference model checkpoints")
     parser.add_argument("--checkpoint", default=None, help="Explicit checkpoint path, bypassing best-by-psnr auto-discovery in model_dir")
     parser.add_argument("--psnr_only", action="store_true", help="Skip torch.compile and the decode/encode FPS benchmarking loops (30+ full-video forward passes); just load the checkpoint and measure PSNR")
+    parser.add_argument("--profile_one_call", action="store_true", help="Profile a single warmed-up decode call with torch.profiler and print the top-ops table, then exit")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for decode/PSNR measurement")
     parser.add_argument("--no-compile-model", action="store_true", help="Disable whole-model compilation for inference")
     parser.add_argument("--debug_psnr", action="store_true", help="Print per-frame PSNR values during decode evaluation")
@@ -595,10 +596,26 @@ def main():
 
     macs = compute_macs(model, device)
 
+    print(f"[bench] args.batch_size = {args.batch_size}")
+
     warmup_model(model, vid.shape[0], device, batch_size=args.batch_size)
     if 'cuda' in device:
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
+
+    if args.profile_one_call:
+        from torch.profiler import profile, ProfilerActivity
+        norm_t = torch.zeros(args.batch_size, device=device, dtype=torch.float32)
+        with torch.no_grad():
+            if getattr(model, 'num_segments', 1) > 1 and hasattr(model, 'segment_ranges'):
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                    _ = model.forward_segment(0, norm_t)
+            else:
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                    _ = model(norm_t)
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+        return
+
     decode_fps = measure_decode_fps(model, vid.shape[0], device, batch_size=args.batch_size)
     decode_peak_mem = torch.cuda.max_memory_allocated(device) if 'cuda' in device else None
     psnr = measure_psnr(model, vid, device, batch_size=args.batch_size, debug_psnr=args.debug_psnr)

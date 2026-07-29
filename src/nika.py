@@ -318,6 +318,56 @@ class ConvOperator(nn.Module):
         return conv_x
 
 
+class EfficientConvOperator(nn.Module):
+    """
+    Single depthwise conv -> FiLM -> depthwise conv operator applied to an entire
+    concatenated window of slices at once (replaces separate forward/backward
+    ConvOperators). Grouped by `out_channels` so each base feature channel is
+    processed independently across its window copies and a 3x3 spatial
+    neighborhood; there is no cross-channel (pointwise) mixing anywhere.
+    """
+    def __init__(self, in_channels, out_channels, h_dim, encoding_len=128, device='cuda'):
+        super().__init__()
+        if h_dim % out_channels != 0:
+            raise ValueError(
+                f"EfficientConvOperator requires h_dim ({h_dim}) to be a multiple of "
+                f"out_channels ({out_channels}) for grouped depthwise convs."
+            )
+        self.groups = out_channels
+
+        self.dw1 = nn.Conv2d(in_channels, h_dim, kernel_size=3, padding=1, groups=self.groups).to(device)
+        self.dw2 = nn.Conv2d(h_dim, out_channels, kernel_size=3, padding=1, groups=self.groups).to(device)
+        self.act = nn.GELU()
+
+        self.encoding = FourierEncoding(
+            target_dim=encoding_len,
+            max_freq=64,
+            freq_init="log",
+            device=device
+        )
+
+        self.t_modulator = nn.Sequential(
+            nn.Linear(encoding_len, h_dim),
+            nn.GELU(),
+            nn.Linear(h_dim, 2 * h_dim),
+        ).to(device)
+
+        nn.init.zeros_(self.dw2.weight)
+        nn.init.zeros_(self.dw2.bias)
+        nn.init.zeros_(self.t_modulator[-1].weight)
+        nn.init.zeros_(self.t_modulator[-1].bias)
+
+    def forward(self, x, t):
+        h = self.dw1(x)
+        time_emb = self.encoding(t)
+        modulation = self.t_modulator(time_emb)
+        gamma, beta = modulation.chunk(2, dim=-1)
+        gamma = gamma.view(-1, h.shape[1], 1, 1)
+        beta = beta.view(-1, h.shape[1], 1, 1)
+        h = self.act(h * (1 + gamma) + beta)
+        return self.dw2(h)
+
+
 class NikaBlock(nn.Module):
     def __init__(
         self,
@@ -332,7 +382,8 @@ class NikaBlock(nn.Module):
         op_hdim,
         device,
         complex_grid_ranks=None,
-        use_compile=False
+        use_compile=False,
+        efficient_mode=False,
     ):
         super().__init__()
         self.C, self.H, self.W, T = target_shape
@@ -376,6 +427,7 @@ class NikaBlock(nn.Module):
 
         self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
         self.operator_steps = operator_steps
+        self.efficient_mode = efficient_mode
         self.register_buffer(
             "_zero_base",
             torch.zeros(1, self.C, self.H, self.W, device=device, dtype=torch.float32),
@@ -387,23 +439,32 @@ class NikaBlock(nn.Module):
             persistent=False,
         )
 
-        self.forward_operators = nn.ModuleList()
-        self.backward_operators = nn.ModuleList()
-        for _ in range(self.operator_steps):
-            fwd = ConvOperator(
-                in_channels = 2 * self.n_heads * self.C,
+        if self.efficient_mode:
+            window_size = 2 * self.operator_steps + 1
+            self.window_operator = EfficientConvOperator(
+                in_channels = window_size * self.n_heads * self.C,
                 out_channels = self.n_heads * self.C,
                 h_dim = op_hdim,
                 device = device,
             )
-            bwd = ConvOperator(
-                in_channels = 2 * self.n_heads * self.C,
-                out_channels = self.n_heads * self.C,
-                h_dim = op_hdim,
-                device = device,
-            )
-            self.forward_operators.append(fwd)
-            self.backward_operators.append(bwd)
+        else:
+            self.forward_operators = nn.ModuleList()
+            self.backward_operators = nn.ModuleList()
+            for _ in range(self.operator_steps):
+                fwd = ConvOperator(
+                    in_channels = 2 * self.n_heads * self.C,
+                    out_channels = self.n_heads * self.C,
+                    h_dim = op_hdim,
+                    device = device,
+                )
+                bwd = ConvOperator(
+                    in_channels = 2 * self.n_heads * self.C,
+                    out_channels = self.n_heads * self.C,
+                    h_dim = op_hdim,
+                    device = device,
+                )
+                self.forward_operators.append(fwd)
+                self.backward_operators.append(bwd)
 
         self.upres = BasicUpres(
             in_channels = self.n_heads * self.C,
@@ -430,6 +491,10 @@ class NikaBlock(nn.Module):
             complex_tucker_params = sum(p.numel() for p in self.complex_tucker.parameters())
             print(f"  Complex Tucker:  {complex_tucker_params / 1e6:.3f}M")
             total_params += complex_tucker_params
+        if hasattr(self, 'window_operator'):
+            window_op_params = sum(p.numel() for p in self.window_operator.parameters())
+            print(f"  Window Operator: {window_op_params / 1e6:.3f}M")
+            total_params += window_op_params
         if hasattr(self, 'forward_operators'):
             forward_params = sum(p.numel() for p in self.forward_operators.parameters())
             print(f"  Forward Operators:{forward_params / 1e6:.3f}M")
@@ -495,24 +560,32 @@ class NikaBlock(nn.Module):
         center_idx = S
         current_input = base_all_gnorm[:, center_idx]
 
-        operator_residual = torch.zeros_like(current_input)
+        if self.efficient_mode:
+            # group channels by base feature channel (not by window position), so the
+            # grouped convs in EfficientConvOperator treat each base channel's window
+            # copies as one group instead of mixing unrelated channels together
+            window_input = base_all_gnorm.permute(0, 2, 1, 3, 4).reshape(B, total_c * (2 * S + 1), self.H, self.W)
+            operator_residual = self.window_operator(window_input, times[:, center_idx])
+            forward_prediction = backward_prediction = operator_residual
+        else:
+            operator_residual = torch.zeros_like(current_input)
 
-        for i in range(S):
-            prev_idx = center_idx - (i + 1)
-            next_idx = center_idx + (i + 1)
+            for i in range(S):
+                prev_idx = center_idx - (i + 1)
+                next_idx = center_idx + (i + 1)
 
-            prev_base = base_all_gnorm[:, prev_idx]
-            next_base = base_all_gnorm[:, next_idx]
+                prev_base = base_all_gnorm[:, prev_idx]
+                next_base = base_all_gnorm[:, next_idx]
 
-            forward_operator = self.forward_operators[i]
-            forward_input = torch.cat([prev_base, current_input], dim=1)
-            forward_prediction = forward_operator(forward_input, times[:, prev_idx])
-            operator_residual += forward_prediction
+                forward_operator = self.forward_operators[i]
+                forward_input = torch.cat([prev_base, current_input], dim=1)
+                forward_prediction = forward_operator(forward_input, times[:, prev_idx])
+                operator_residual += forward_prediction
 
-            backward_operator = self.backward_operators[i]
-            backward_input = torch.cat([current_input, next_base], dim=1)
-            backward_prediction = backward_operator(backward_input, times[:, next_idx])
-            operator_residual += backward_prediction
+                backward_operator = self.backward_operators[i]
+                backward_input = torch.cat([current_input, next_base], dim=1)
+                backward_prediction = backward_operator(backward_input, times[:, next_idx])
+                operator_residual += backward_prediction
 
         aggregated = current_input + operator_residual
         refined = self.upres(aggregated)
@@ -621,7 +694,7 @@ class MosaicNika(nn.Module):
         return outputs
 
 
-def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, num_segments=None, operator_steps=None):
+def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, num_segments=None, operator_steps=None, efficient_mode=False):
     base_name = os.path.basename(dataset_name)
     model_kwargs = REFERENCES[config]
     # copy and allow dataset-specific overrides
@@ -641,6 +714,9 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
     # allow CLI override for operator_steps; otherwise keep config value
     if operator_steps is not None:
         model_kwargs['operator_steps'] = int(operator_steps)
+
+    model_kwargs['efficient_mode'] = bool(efficient_mode)
+    save_config = f"{config}-eff" if efficient_mode else config
 
     model = MosaicNika(
         target_shape=[4, vid.shape[2], vid.shape[3], vid.shape[0]],
@@ -721,7 +797,7 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
                 best_psnr = epoch_psnr
                 best_epoch = epoch
                 os.makedirs("models", exist_ok=True)
-                model_path = f"models/{config}-{model_name}-epoch{epoch}-psnr{best_psnr:.2f}.torch"
+                model_path = f"models/{save_config}-{model_name}-epoch{epoch}-psnr{best_psnr:.2f}.torch"
                 torch.save(model.state_dict(), model_path)
                 os.sync()
                 print(f"[{dataset_name}] New best model saved at epoch {epoch} with PSNR: {best_psnr:.2f}")
@@ -746,11 +822,11 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
     print(f"Best PSNR achieved: {best_psnr:.2f} at epoch {best_epoch}")
 
 
-def run_all_feature_tests(names, basedir, config, device, batch_size=32, num_segments=None, operator_steps=None):
+def run_all_feature_tests(names, basedir, config, device, batch_size=32, num_segments=None, operator_steps=None, efficient_mode=False, seed=45):
     for dataset_name in names:
         print(f"\n=== Starting dataset: {dataset_name} ===")
         vid = load_video_frames(f"{basedir}/{dataset_name}", device, dtype=torch.uint8, normalize=False)
-        torch.manual_seed(45)
+        torch.manual_seed(seed)
         feature_test(
             vid,
             dataset_name=dataset_name,
@@ -760,6 +836,7 @@ def run_all_feature_tests(names, basedir, config, device, batch_size=32, num_seg
             batch_size=batch_size,
             num_segments=num_segments,
             operator_steps=operator_steps,
+            efficient_mode=efficient_mode,
         )
 
 
@@ -772,6 +849,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32, help="Initial training batch size")
     parser.add_argument("--segments", type=int, default=None, help="Number of temporal model shards for mosaic mode (overrides config)")
     parser.add_argument("--operator_steps", type=int, default=None, help="Number of operator steps (overrides config)")
+    parser.add_argument("--efficient_mode", action="store_true", help="Use a single dw-FiLM-dw operator over the whole temporal window instead of separate forward/backward ConvOperators")
+    parser.add_argument("--seed", type=int, default=45, help="Seed for model init / training (default: 45, matches prior hardcoded behavior)")
     args = parser.parse_args()
 
     device = args.device
@@ -809,4 +888,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_segments=args.segments,
         operator_steps=args.operator_steps,
+        efficient_mode=args.efficient_mode,
+        seed=args.seed,
     )

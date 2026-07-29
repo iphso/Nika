@@ -65,6 +65,7 @@ def main():
     parser.add_argument("--segments", type=int, default=None)
     parser.add_argument("--operator_steps", type=int, default=None)
     parser.add_argument("--efficient_mode", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     src_dir = os.path.dirname(os.path.abspath(__file__))
@@ -87,6 +88,8 @@ def main():
         cmd += ["--operator_steps", str(args.operator_steps)]
     if args.efficient_mode:
         cmd += ["--efficient_mode"]
+    if args.seed is not None:
+        cmd += ["--seed", str(args.seed)]
 
     gpu_index = gpu_index_from_device(args.device)
 
