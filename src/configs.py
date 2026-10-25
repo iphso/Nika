@@ -279,3 +279,9 @@ REFERENCES = {
         "num_segments": 4,
     },
 }
+
+# UVG frames are 2.25x Bunny's area, so the xxs Tucker factors grow and xxsN overshoots the
+# param ladder by ~20% there; spatial ranks 40/30 -> 32/24 bring xxs1..xxs16 to 0.75..12M (+-6%).
+for _n in (1, 2, 4, 8, 16):
+    REFERENCES[f"xxs{_n}-r32"] = dict(REFERENCES[f"xxs{_n}"], real_tucker_ranks=[2, 32, 32, 32],
+                                      complex_tucker_ranks=[2, 24, 24, 24])
