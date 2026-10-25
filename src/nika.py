@@ -783,7 +783,9 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
     current_batch_size = batch_size
     epoch = 0
 
-    while epoch < 2000:
+    # wall-clock bench lifts the epoch cap (the runner stops training at the time budget)
+    max_epochs = int(os.environ.get("NB_MAX_EPOCHS", 2000))
+    while epoch < max_epochs:
         try:
             nb_hook.poll(model.state_dict, epoch)
             opt.zero_grad(set_to_none=True)
