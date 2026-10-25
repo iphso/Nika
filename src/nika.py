@@ -1,4 +1,5 @@
 import argparse
+import nb_hook
 import re
 import os
 import time
@@ -728,6 +729,28 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
     )
     segment_ranges = model.segment_ranges
 
+    nb_hook.count_exit(sum(p.numel() for p in model.parameters()))
+    if nb_hook.EVAL_DIR:
+        # wall-clock bench eval: decode frames exactly as training addresses them (per-segment local t)
+        seg_starts = torch.tensor([s for s, _ in segment_ranges], device=device)
+
+        def decode(idx):
+            seg = torch.searchsorted(seg_starts, idx, right=True) - 1
+            out = None
+            for sid in seg.unique().tolist():
+                mask = seg == sid
+                s, e = segment_ranges[sid]
+                pred = model.forward_segment(sid, (idx[mask].float() - s) / max(e - s - 1, 1))
+                if pred.ndim == 3:
+                    pred = pred.unsqueeze(0)
+                if out is None:
+                    out = pred.new_empty((idx.shape[0],) + pred.shape[1:])
+                out[mask] = pred
+            return out
+
+        nb_hook.evaluate(model, decode, frame_dir=os.environ["NB_FRAME_DIR"], device=device)
+        return
+
     base_lr = 1e-2
     basis_params = []
     for sm in model.models:
@@ -762,6 +785,7 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
 
     while epoch < 2000:
         try:
+            nb_hook.poll(model.state_dict, epoch)
             opt.zero_grad(set_to_none=True)
             loss = 0.0
             start_time = time.time()
@@ -793,7 +817,8 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
             epoch_psnr = -loss.item()
             print(f"[{dataset_name}] Epoch {epoch} loss: {loss.item():.4f}, time: {average_frame_time:.5f}s, PSNR: {epoch_psnr:.2f}")
 
-            if epoch_psnr > best_psnr and (epoch - best_epoch >= 10 or best_epoch == -1):
+            # wall-clock bench: snapshots come from nb_hook, so skip the best-model save (and its os.sync)
+            if not nb_hook.ACTIVE and epoch_psnr > best_psnr and (epoch - best_epoch >= 10 or best_epoch == -1):
                 best_psnr = epoch_psnr
                 best_epoch = epoch
                 os.makedirs("models", exist_ok=True)
@@ -809,6 +834,7 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
                 print(f"[{dataset_name}] Epoch {epoch}: Tucker PSNR: {epoch_psnr:.2f}")
 
             epoch += 1
+            nb_hook.epoch_end(epoch, vid.shape[0])
         except RuntimeError as e:
             if 'out of memory' in str(e).lower():
                 torch.cuda.empty_cache()
@@ -819,6 +845,7 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
                 continue
             raise
 
+    nb_hook.final(model.state_dict, epoch)
     print(f"Best PSNR achieved: {best_psnr:.2f} at epoch {best_epoch}")
 
 
@@ -860,6 +887,7 @@ if __name__ == "__main__":
         elif re.fullmatch(r"cuda\d+", device):
             device = device.replace('cuda', 'cuda:')
 
+    nb_hook.install()
     torch.manual_seed(42)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
