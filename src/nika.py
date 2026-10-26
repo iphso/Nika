@@ -751,7 +751,8 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
         nb_hook.evaluate(model, decode, frame_dir=os.environ["NB_FRAME_DIR"], device=device)
         return
 
-    base_lr = 1e-2
+    # wall-clock bench: NB_LR overrides the peak LR (LR sweep); default unchanged
+    base_lr = float(os.environ.get("NB_LR", 1e-2))
     basis_params = []
     for sm in model.models:
         if hasattr(sm, 'real_tucker'):
@@ -778,6 +779,24 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
         min_lr=2e-3,
     )
 
+    # wall-clock bench: NB_SCHED_EPOCHS=E replaces the plateau schedule with one fitted to the
+    # time budget, as each baseline's own schedule is: optional linear warmup over
+    # NB_WARMUP_EPOCHS, then cosine decay to NB_MIN_LR_FRAC x peak at epoch E (one SOAP step
+    # per epoch). Unset, Nika trains with its native ReduceLROnPlateau.
+    sched_epochs = int(os.environ.get("NB_SCHED_EPOCHS", 0))
+    if sched_epochs:
+        warmup = int(os.environ.get("NB_WARMUP_EPOCHS", 0))
+        floor = float(os.environ.get("NB_MIN_LR_FRAC", 0.1))
+
+        def fitted(e):
+            if e < warmup:
+                return (e + 1) / warmup
+            prog = min(1.0, (e - warmup) / max(1, sched_epochs - warmup))
+            return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * prog))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, fitted)
+        print(f"NB fitted schedule: peak_lr={base_lr} epochs={sched_epochs} warmup={warmup} floor={floor}", flush=True)
+
     best_psnr = float('-inf')
     best_epoch = -1
     current_batch_size = batch_size
@@ -785,6 +804,8 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
 
     # wall-clock bench lifts the epoch cap (the runner stops training at the time budget)
     max_epochs = int(os.environ.get("NB_MAX_EPOCHS", 2000))
+    if sched_epochs:
+        max_epochs = sched_epochs
     while epoch < max_epochs:
         try:
             nb_hook.poll(model.state_dict, epoch)
@@ -830,7 +851,7 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
                 print(f"[{dataset_name}] New best model saved at epoch {epoch} with PSNR: {best_psnr:.2f}")
 
             opt.step()
-            scheduler.step(epoch_psnr)
+            scheduler.step() if sched_epochs else scheduler.step(epoch_psnr)
 
             if epoch % 25 == 0:
                 print(f"[{dataset_name}] Epoch {epoch}: Tucker PSNR: {epoch_psnr:.2f}")

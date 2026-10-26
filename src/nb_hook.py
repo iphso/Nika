@@ -1,17 +1,22 @@
 """
 Wall-clock benchmark hook, dropped verbatim into every method's repo.
 
-The runner (nb_run.py) sends SIGUSR1 at each wall-clock mark. The signal handler only
-records the request; the training loop calls poll() at the top of every optimizer step,
-which saves the model weights as they stood at that moment. That keeps snapshotting out
-of the hot path (no per-epoch checkpoint I/O for anyone) and makes the snapshot the
-state at the first step boundary after the mark, for every method alike.
+The budget is measured in training time: the clock starts at the first optimizer step and
+is paused while a snapshot is written, so process startup (imports, data loading, model
+build) and snapshot I/O count for no one, and no method trains in someone else's eval.
+Evaluation never runs inside training; every snapshot is evaluated afterwards (NB_EVAL_DIR).
+
+The training loop calls poll() at the top of every optimizer step. When the training clock
+has passed the next mark (NB_MARKS, minutes), poll() saves the weights as they stand, so a
+snapshot is the state at the first step boundary after its mark, for every method alike.
+After the last mark the process exits. A trainer whose schedule ends before the budget
+calls final(), whose weights then stand for every later mark.
 
 Inactive unless NB_SNAP_DIR is set, so the repos behave natively otherwise.
 """
 import json
 import os
-import signal
+import sys
 import time
 
 import torch
@@ -19,15 +24,21 @@ import torch
 SNAP_DIR = os.environ.get("NB_SNAP_DIR")
 ACTIVE = bool(SNAP_DIR)
 T0 = float(os.environ.get("NB_T0", time.time()))
+MARKS = [float(m) * 60 for m in os.environ.get("NB_MARKS", "").split(",") if m]
 
-_pending = []
 _n_saved = 0
-_epochs = []
-_started = None
+_started = None     # wall time of the first optimizer step
+_paused = 0.0       # seconds spent writing snapshots, excluded from the training clock
 
 
-def _on_signal(signum, frame):
-    _pending.append(time.time())
+def _sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def train_elapsed():
+    """Seconds of training so far (0 before the first step)."""
+    return 0.0 if _started is None else time.time() - _started - _paused
 
 
 def install():
@@ -38,17 +49,29 @@ def install():
     torch.set_float32_matmul_precision("high")
     if ACTIVE:
         os.makedirs(SNAP_DIR, exist_ok=True)
-        signal.signal(signal.SIGUSR1, _on_signal)
-        print(f"NB_HOOK active snap_dir={SNAP_DIR}", flush=True)
+        print(f"NB_HOOK active snap_dir={SNAP_DIR} marks_s={MARKS}", flush=True)
 
 
-def _save(state_fn, tag, t_req, epoch):
+def _save(state_fn, tag, epoch, mark_s):
+    """Write a snapshot with the training clock stopped."""
+    global _paused
+    _sync()                       # queued kernels belong to training: finish them on the clock
+    t_train = train_elapsed()
+    t = time.time()
     state = {k: v.detach().cpu() for k, v in state_fn().items()}
     path = os.path.join(SNAP_DIR, f"{tag}.pt")
-    torch.save({"state_dict": state, "epoch": epoch, "t_req": t_req - T0,
-                "t_save": time.time() - T0}, path + ".tmp")
+    torch.save({"state_dict": state, "epoch": epoch, "t_train": t_train, "mark_s": mark_s}, path + ".tmp")
     os.replace(path + ".tmp", path)
-    print(f"NB_SNAP {tag} epoch={epoch} t_req={t_req - T0:.2f} t_save={time.time() - T0:.2f}", flush=True)
+    _paused += time.time() - t
+    print(f"NB_SNAP {tag} epoch={epoch} t_train={t_train:.2f} mark_s={mark_s} "
+          f"t_wall={time.time() - T0:.2f} save_s={time.time() - t:.2f}", flush=True)
+
+
+def _done():
+    print(f"NB_DONE t_train={train_elapsed():.2f} paused_s={_paused:.2f}", flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 def poll(state_fn, epoch):
@@ -57,31 +80,29 @@ def poll(state_fn, epoch):
     if not ACTIVE:
         return
     if _started is None:
+        _sync()
         _started = time.time()
         print(f"NB_TRAIN_START t={_started - T0:.2f}", flush=True)
-    while _pending:
-        t_req = _pending.pop(0)
-        _save(state_fn, f"snap_{_n_saved:02d}", t_req, epoch)
+    while _n_saved < len(MARKS) and train_elapsed() >= MARKS[_n_saved]:
+        _save(state_fn, f"snap_{_n_saved:02d}", epoch, MARKS[_n_saved])
         _n_saved += 1
+    if MARKS and _n_saved == len(MARKS):
+        _done()
 
 
 def epoch_end(epoch, frames):
     """After each full pass over the video (epoch = number of completed epochs)."""
     if ACTIVE:
-        print(f"NB_EPOCH {epoch} frames={frames} t={time.time() - T0:.3f}", flush=True)
+        _sync()
+        print(f"NB_EPOCH {epoch} frames={frames} t={train_elapsed():.3f}", flush=True)
 
 
 def final(state_fn, epoch):
-    """Training finished before the budget: serve pending marks and leave a final snapshot."""
-    global _n_saved
+    """Training finished before the budget: these weights stand for every remaining mark."""
     if not ACTIVE:
         return
-    while _pending:
-        t_req = _pending.pop(0)
-        _save(state_fn, f"snap_{_n_saved:02d}", t_req, epoch)
-        _n_saved += 1
-    _save(state_fn, "snap_final", time.time(), epoch)
-    print("NB_DONE", flush=True)
+    _save(state_fn, "snap_final", epoch, None)
+    _done()
 
 
 # ----------------------------------------------------------------------------------------
