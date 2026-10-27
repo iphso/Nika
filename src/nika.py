@@ -846,8 +846,8 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
                     gt = vid[fids].to(torch.float32) / 255.0
                     local_t = (fids.float() - s) / max(e - s - 1, 1)
                     mse = F.mse_loss(model.forward_segment(sid, local_t), gt)
-                    # -PSNR per segment group, weighted by its share of the step's frames
-                    frame_loss = -10.0 * torch.log10(mse + 1e-8) * (fids.numel() / idx.numel())
+                    # loss = -PSNR = 10 log10(mse) per segment group, weighted by its share of the step's frames
+                    frame_loss = 10.0 * torch.log10(mse + 1e-8) * (fids.numel() / idx.numel())
                     frame_loss.backward()
                     batch_loss += frame_loss.detach()
                 opt.step()
@@ -855,8 +855,8 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
                     scheduler.step()
                 loss_sum += batch_loss * idx.numel()
             epoch += 1
-            if epoch % 25 == 0:
-                print(f"[{dataset_name}] Epoch {epoch}: mean step PSNR: {-loss_sum.item() / n:.2f}")
+            if epoch % 5 == 0:
+                print(f"[{dataset_name}] Epoch {epoch}: mean step PSNR: {-loss_sum.item() / n:.2f}", flush=True)
             nb_hook.epoch_end(epoch, n)
         nb_hook.final(model.state_dict, epoch)
         return
