@@ -831,6 +831,37 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
             scheduler = torch.optim.lr_scheduler.LambdaLR(opt, fitted_steps)
             print(f"NB step mode: {step_frames} frames/step, {steps_per_epoch} steps/epoch, "
                   f"schedule {sched_steps} steps (warmup {warmup_steps})", flush=True)
+
+        # NB_GROUP_MAX=c bounds memory: shuffled steps occasionally land far more than k/S frames in
+        # one segment, and backward runs per segment group. A group over c frames runs in chunks of
+        # at most c with the exact same gradient: grad of 10 log10(mse_g) is 10/(ln10 mse_g) grad mse_g,
+        # and mse_g is the frame-weighted mean of the chunk mses, so the chunks backprop their share of
+        # mse_g into a clean grad buffer that is rescaled once mse_g is known.
+        group_max = int(os.environ.get("NB_GROUP_MAX", 0))
+        params = [p for g in opt.param_groups for p in g["params"]]
+
+        def chunked_group_backward(sid, s, e, fids, share):
+            prev = [p.grad for p in params]
+            for p in params:
+                p.grad = None
+            mse_g = 0.0
+            for c in fids.split(group_max):
+                gt = vid[c].to(torch.float32) / 255.0
+                local_t = (c.float() - s) / max(e - s - 1, 1)
+                mse_c = F.mse_loss(model.forward_segment(sid, local_t), gt) * (c.numel() / fids.numel())
+                mse_c.backward()
+                mse_g = mse_g + mse_c.detach()
+            w = 10.0 / math.log(10.0) * share / (mse_g + 1e-8)
+            for p, g0 in zip(params, prev):
+                if p.grad is not None:
+                    p.grad.mul_(w)
+                    if g0 is not None:
+                        p.grad.add_(g0)
+                else:
+                    p.grad = g0
+            return 10.0 * torch.log10(mse_g + 1e-8) * share
+        if group_max:
+            print(f"NB group max: {group_max} frames per backward", flush=True)
         while epoch < max_epochs:
             order = torch.randperm(n, device=device)
             loss_sum = 0.0
@@ -843,11 +874,15 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
                 for sid in seg.unique().tolist():
                     s, e = segment_ranges[sid]
                     fids = idx[seg == sid]
+                    share = fids.numel() / idx.numel()
+                    if group_max and fids.numel() > group_max:
+                        batch_loss += chunked_group_backward(sid, s, e, fids, share)
+                        continue
                     gt = vid[fids].to(torch.float32) / 255.0
                     local_t = (fids.float() - s) / max(e - s - 1, 1)
                     mse = F.mse_loss(model.forward_segment(sid, local_t), gt)
                     # loss = -PSNR = 10 log10(mse) per segment group, weighted by its share of the step's frames
-                    frame_loss = 10.0 * torch.log10(mse + 1e-8) * (fids.numel() / idx.numel())
+                    frame_loss = 10.0 * torch.log10(mse + 1e-8) * share
                     frame_loss.backward()
                     batch_loss += frame_loss.detach()
                 opt.step()
