@@ -806,6 +806,61 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
     max_epochs = int(os.environ.get("NB_MAX_EPOCHS", 2000))
     if sched_epochs:
         max_epochs = sched_epochs
+
+    # wall-clock bench: NB_STEP_FRAMES=k takes an optimizer step every k frames, drawn shuffled
+    # across the whole video each epoch, the way the baselines train (one frame per step at k=1),
+    # instead of one step per epoch over the accumulated full-video gradient. The fitted schedule
+    # keeps its epoch count and runs over the matching number of steps.
+    step_frames = int(os.environ.get("NB_STEP_FRAMES", 0))
+    if step_frames:
+        n = vid.shape[0]
+        seg_starts = torch.tensor([s for s, _ in segment_ranges], device=device)
+        steps_per_epoch = (n + step_frames - 1) // step_frames
+        if sched_epochs:
+            sched_steps = sched_epochs * steps_per_epoch
+            warmup_steps = warmup * steps_per_epoch
+
+            def fitted_steps(s):
+                if s < warmup_steps:
+                    return (s + 1) / warmup_steps
+                prog = min(1.0, (s - warmup_steps) / max(1, sched_steps - warmup_steps))
+                return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * prog))
+
+            for g in opt.param_groups:
+                g["lr"] = g["initial_lr"]
+            scheduler = torch.optim.lr_scheduler.LambdaLR(opt, fitted_steps)
+            print(f"NB step mode: {step_frames} frames/step, {steps_per_epoch} steps/epoch, "
+                  f"schedule {sched_steps} steps (warmup {warmup_steps})", flush=True)
+        while epoch < max_epochs:
+            order = torch.randperm(n, device=device)
+            loss_sum = 0.0
+            for b in range(steps_per_epoch):
+                nb_hook.poll(model.state_dict, epoch)
+                idx = order[b * step_frames:(b + 1) * step_frames]
+                seg = torch.searchsorted(seg_starts, idx, right=True) - 1
+                opt.zero_grad(set_to_none=True)
+                batch_loss = 0.0
+                for sid in seg.unique().tolist():
+                    s, e = segment_ranges[sid]
+                    fids = idx[seg == sid]
+                    gt = vid[fids].to(torch.float32) / 255.0
+                    local_t = (fids.float() - s) / max(e - s - 1, 1)
+                    mse = F.mse_loss(model.forward_segment(sid, local_t), gt)
+                    # -PSNR per segment group, weighted by its share of the step's frames
+                    frame_loss = -10.0 * torch.log10(mse + 1e-8) * (fids.numel() / idx.numel())
+                    frame_loss.backward()
+                    batch_loss += frame_loss.detach()
+                opt.step()
+                if sched_epochs:
+                    scheduler.step()
+                loss_sum += batch_loss * idx.numel()
+            epoch += 1
+            if epoch % 25 == 0:
+                print(f"[{dataset_name}] Epoch {epoch}: mean step PSNR: {-loss_sum.item() / n:.2f}")
+            nb_hook.epoch_end(epoch, n)
+        nb_hook.final(model.state_dict, epoch)
+        return
+
     while epoch < max_epochs:
         try:
             nb_hook.poll(model.state_dict, epoch)
