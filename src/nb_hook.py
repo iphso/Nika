@@ -12,6 +12,8 @@ snapshot is the state at the first step boundary after its mark, for every metho
 After the last mark the process exits. A trainer whose schedule ends before the budget
 calls final(), whose weights then stand for every later mark.
 
+NB_MEM_GIB caps GPU memory for every method alike (the envelope of a smaller card).
+
 Inactive unless NB_SNAP_DIR is set, so the repos behave natively otherwise.
 """
 import json
@@ -47,6 +49,13 @@ def install():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
+    # Matched memory envelope: NB_MEM_GIB caps the CUDA caching allocator, so a method that needs
+    # more than the envelope OOMs here exactly as it would on the smaller card.
+    cap = os.environ.get("NB_MEM_GIB")
+    if cap and torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction(float(cap) * 2**30 / total, 0)
+        print(f"NB_MEM cap_gib={float(cap)} of {total / 2**30:.1f}", flush=True)
     if ACTIVE:
         os.makedirs(SNAP_DIR, exist_ok=True)
         print(f"NB_HOOK active snap_dir={SNAP_DIR} marks_s={MARKS}", flush=True)
