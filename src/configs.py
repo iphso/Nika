@@ -285,3 +285,10 @@ REFERENCES = {
 for _n in (1, 2, 4, 8, 16):
     REFERENCES[f"xxs{_n}-r32"] = dict(REFERENCES[f"xxs{_n}"], real_tucker_ranks=[2, 32, 32, 32],
                                       complex_tucker_ranks=[2, 24, 24, 24])
+
+# Bench conv-width probe: the ConvNeXt upres head runs at full resolution on every frame but holds
+# few params, so its width trades encode/decode speed against fidelity at ~constant model size.
+for _base in [k for k in REFERENCES if k.startswith("xxs") and k[3:].split("-")[0].isdigit()
+              and (k.count("-") == 0 or k.endswith("-r32"))]:
+    for _w in (16, 24, 32, 64, 96):
+        REFERENCES[f"{_base}-c{_w}"] = dict(REFERENCES[_base], conv_hidden=_w)
