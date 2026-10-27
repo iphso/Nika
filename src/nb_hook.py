@@ -77,7 +77,8 @@ def _save(state_fn, tag, epoch, mark_s):
 
 
 def _done():
-    print(f"NB_DONE t_train={train_elapsed():.2f} paused_s={_paused:.2f}", flush=True)
+    mem = torch.cuda.max_memory_reserved() / 2**30 if torch.cuda.is_available() else 0.0
+    print(f"NB_DONE t_train={train_elapsed():.2f} paused_s={_paused:.2f} max_reserved_gib={mem:.2f}", flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
