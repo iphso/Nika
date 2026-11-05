@@ -171,6 +171,20 @@ class ComplexTucker(RealTucker):
         return real_tucker.contiguous()
 
 
+class RealProductHead(nn.Module):
+    """Real-domain mirror of the spectral head (ablation control): real Tucker x real feature grid,
+    multiplied elementwise like ComplexTucker's Tucker x grid, with no FFT."""
+
+    def __init__(self, target_shape, ranks, grid_channels, device='cuda'):
+        super().__init__()
+        self.tucker = RealTucker(target_shape, ranks, device=device)
+        C, H, W, T = target_shape
+        self.feature_grid = FeatureGrid([C, H, W, T], grid_res=grid_channels, device=device)
+
+    def forward(self, t):
+        return (self.tucker(t) * self.feature_grid(t)).contiguous()
+
+
 def grid_sample_base(H, W, device):
     y_lin = torch.arange(0, H, device=device)
     x_lin = torch.arange(0, W, device=device)
@@ -383,6 +397,10 @@ class NikaBlock(nn.Module):
         op_hdim,
         device,
         complex_grid_ranks=None,
+        realprod_tucker_ranks=None,
+        realprod_grid_ranks=None,
+        spec_tucker_ranks=None,
+        spec_grid_ranks=None,
         use_compile=False,
         efficient_mode=False,
     ):
@@ -425,6 +443,20 @@ class NikaBlock(nn.Module):
             )
             self.n_heads += 1
             self._head_order.append('complex')
+
+        # ablation-control heads (Experiment D); absent from every standard config
+        if realprod_tucker_ranks:
+            self.realprod = RealProductHead(self.internal_shape, realprod_tucker_ranks, realprod_grid_ranks, device=device)
+            self.n_heads += 1
+            self._head_order.append('realprod')
+        if spec_tucker_ranks:
+            self.spec_tucker = ComplexTucker(self.internal_shape, ranks=spec_tucker_ranks, grid_channels=None, device=device)
+            self.n_heads += 1
+            self._head_order.append('spec_tucker')
+        if spec_grid_ranks:
+            self.spec_grid = ComplexTucker(self.internal_shape, ranks=None, grid_channels=spec_grid_ranks, device=device)
+            self.n_heads += 1
+            self._head_order.append('spec_grid')
 
         self.groupnorm = nn.GroupNorm(num_groups=self.n_heads, num_channels=self.n_heads * self.C).to(device)
         self.operator_steps = operator_steps
@@ -548,6 +580,10 @@ class NikaBlock(nn.Module):
             comps['complex'] = complex_all.view(B, 2 * S + 1, self.C, self.H, self.W)
         else:
             comps['complex'] = zero_base.unsqueeze(1).expand(B, 2 * S + 1, -1, -1, -1)
+
+        for name in ('realprod', 'spec_tucker', 'spec_grid'):
+            if hasattr(self, name):
+                comps[name] = getattr(self, name)(times_flat).view(B, 2 * S + 1, self.C, self.H, self.W)
 
         # Build concatenation in the same order heads were created so GroupNorm groups
         parts = [comps[name] for name in getattr(self, '_head_order', ['grid', 'real', 'complex'])]
@@ -748,7 +784,17 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
                 out[mask] = pred
             return out
 
-        nb_hook.evaluate(model, decode, frame_dir=os.environ["NB_FRAME_DIR"], device=device)
+        COMPONENTS = {"real_tucker": "real_tucker", "grid_features": "grid", "complex_tucker": "spectral",
+                      "realprod": "realprod", "spec_tucker": "spec_tucker", "spec_grid": "spec_grid",
+                      "forward_operators": "operators", "backward_operators": "operators",
+                      "window_operator": "operators", "upres": "decoder", "groupnorm": "norm"}
+
+        def component_of(path):
+            # FlopCounter module paths, e.g. NikaBlock.upres.convnext.dw_conv -> decoder
+            return next((COMPONENTS[t] for t in path.split(".") if t in COMPONENTS), None)
+
+        nb_hook.evaluate(model, decode, frame_dir=os.environ["NB_FRAME_DIR"], device=device,
+                         profile_fn=lambda fn, T: nb_hook.profile(model, fn, T, device, component_of=component_of))
         return
 
     # wall-clock bench: NB_LR overrides the peak LR (LR sweep); default unchanged
@@ -761,6 +807,9 @@ def feature_test(vid, dataset_name, model_name, config, device, batch_size=32, n
             basis_params.extend(list(sm.complex_tucker.parameters()))
         if hasattr(sm, 'grid_features'):
             basis_params.extend(list(sm.grid_features.parameters()))
+        for _name in ('realprod', 'spec_tucker', 'spec_grid'):
+            if hasattr(sm, _name):
+                basis_params.extend(list(getattr(sm, _name).parameters()))
     basis_ids = set(map(id, basis_params))
     rest_params = [p for p in model.parameters() if id(p) not in basis_ids]
     opt = SOAP([

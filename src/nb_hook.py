@@ -78,7 +78,9 @@ def _save(state_fn, tag, epoch, mark_s):
 
 def _done():
     mem = torch.cuda.max_memory_reserved() / 2**30 if torch.cuda.is_available() else 0.0
-    print(f"NB_DONE t_train={train_elapsed():.2f} paused_s={_paused:.2f} max_reserved_gib={mem:.2f}", flush=True)
+    alloc = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+    print(f"NB_DONE t_train={train_elapsed():.2f} paused_s={_paused:.2f} max_reserved_gib={mem:.2f} "
+          f"max_allocated_gib={alloc:.3f}", flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
@@ -154,7 +156,74 @@ def _decode_fps(fn, n_frames, batch, device, warmup_passes=2, passes=5):
 
 
 @torch.no_grad()
-def evaluate(model, decode, frame_dir, device, load=None, decode_only=None, n_params=None, psnr_batch=1):
+def _fft_flops(x_shape, dim, *a, out_shape=None, **kw):
+    """FFT cost convention: 2.5 N log2 N real flops per real-input/real-output transform of N points."""
+    import math
+    n = math.prod(out_shape[d] for d in dim)
+    return int(math.prod(out_shape) // n * 2.5 * n * math.log2(max(n, 2)))
+
+
+@torch.no_grad()
+def profile(model, decode, n_frames, device, component_of=None, passes=3):
+    """Active per-frame compute and decode cost at batch 1, the deployment setting.
+    macs = counted flops / 2 (matmul/conv/einsum exact; FFTs by the 2.5 N log2 N convention, reported
+    separately). component_of(module_path) -> component name, for the per-component split."""
+    from torch.utils.flop_counter import FlopCounterMode
+    ops = torch.ops.aten
+    fc = FlopCounterMode(display=False, depth=10, custom_mapping={ops._fft_c2r: _fft_flops, ops._fft_r2c: _fft_flops, ops._fft_c2c: _fft_flops})
+    idx = torch.tensor([n_frames // 2], device=device)
+    # inference-mode params: FlopCounter's module tracker trips over views of grad-requiring leaves
+    req = [(p, p.requires_grad) for p in model.parameters()]
+    for p, _ in req:
+        p.requires_grad_(False)
+    try:
+        with fc:
+            decode(idx)
+    finally:
+        for p, r in req:
+            p.requires_grad_(r)
+    counts = fc.get_flop_counts()
+    total = fc.get_total_flops()
+    fft = sum(v for k, v in counts["Global"].items() if "fft" in str(k))
+    comp = {}
+    if component_of:
+        # leaf-most attribution: a module path's flops minus its children's, summed per component
+        paths = {k: sum(v.values()) for k, v in counts.items() if k != "Global"}
+        for k, v in paths.items():
+            own = v - sum(w for c, w in paths.items() if c.startswith(k + ".") and c.count(".") == k.count(".") + 1)
+            name = component_of(k)
+            if name and own:
+                comp[name] = comp.get(name, 0) + own / 2
+    # latency: every frame, one at a time, synchronized per frame
+    for i in range(min(n_frames, 16)):
+        decode(torch.tensor([i], device=device))
+    torch.cuda.synchronize(device)
+    lat = []
+    for _ in range(passes):
+        for i in range(n_frames):
+            t = time.perf_counter()
+            decode(torch.tensor([i], device=device))
+            torch.cuda.synchronize(device)
+            lat.append(time.perf_counter() - t)
+    lat.sort()
+    # decode-only memory: weights resident, then one bs1 decode pass
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    base = torch.cuda.memory_allocated(device)
+    for i in range(n_frames):
+        decode(torch.tensor([i], device=device))
+    torch.cuda.synchronize(device)
+    peak = torch.cuda.max_memory_allocated(device)
+    params = list(model.parameters())
+    return dict(macs_per_frame=total / 2, fft_macs_per_frame=fft / 2, macs_by_component=comp,
+                latency_ms_bs1_median=1e3 * lat[len(lat) // 2], latency_ms_bs1_p90=1e3 * lat[int(0.9 * len(lat))],
+                decode_peak_alloc_gib=peak / 2**30, decode_weights_gib=base / 2**30,
+                n_params=sum(p.numel() for p in params), n_trainable=sum(p.numel() for p in params if p.requires_grad),
+                gpu=torch.cuda.get_device_name(device))
+
+
+@torch.no_grad()
+def evaluate(model, decode, frame_dir, device, load=None, decode_only=None, n_params=None, psnr_batch=1, profile_fn=None):
     """
     decode(idx) -> [B,3,H,W] float prediction for frame indices idx (LongTensor on device).
     decode_only: optional factory returning the decode-time function used for FPS (e.g. HNeRV
@@ -198,6 +267,9 @@ def evaluate(model, decode, frame_dir, device, load=None, decode_only=None, n_pa
             out["decode_fps"][f"bs{b}"] = None
             torch.cuda.empty_cache()
     print(f"NB_EVAL decode_fps={out['decode_fps']}", flush=True)
+    if profile_fn:
+        out["profile"] = profile_fn(fps_fn, T)
+        print(f"NB_EVAL profile={out['profile']}", flush=True)
     with open(os.path.join(EVAL_DIR, "eval.json"), "w") as f:
         json.dump(out, f, indent=1)
 

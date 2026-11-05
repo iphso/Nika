@@ -292,3 +292,53 @@ for _base in [k for k in REFERENCES if k.startswith("xxs") and k[3:].split("-")[
               and (k.count("-") == 0 or k.endswith("-r32"))]:
     for _w in (16, 24, 32, 64, 96):
         REFERENCES[f"{_base}-c{_w}"] = dict(REFERENCES[_base], conv_hidden=_w)
+
+# ---------------------------------------------------------------------------------------------
+# Camera-ready ablation suite (2026-11-05). Everything below is built on the benchmark's Bunny 3M
+# config (xxs4: segmented, 4 segments) or, for the UVG confirmation, UVG 3M (xs2). Segmentation is
+# never changed. Bunny doubles grid_ranks at build time (feature_test); explicit *_grid_ranks of the
+# new head types below are absolute channel counts and are NOT doubled.
+# ---------------------------------------------------------------------------------------------
+
+def _scale_latent(base, s):
+    """Latent capacity x s: every latent family's parameters scale by ~s, relative allocation kept.
+    Grid channels scale linearly (exact); Tucker cores are rC*rH*rW*rT with rC fixed (C=4), so the
+    spatial/temporal ranks scale by s^(1/3). Decoder and temporal operators untouched."""
+    out = dict(base)
+    out["grid_ranks"] = max(1, round(base["grid_ranks"] * s))
+    for key in ("real_tucker_ranks", "complex_tucker_ranks"):
+        r = base[key]
+        out[key] = [r[0]] + [max(1, round(x * s ** (1 / 3))) for x in r[1:]]
+    return out
+
+
+def _scale_decoder(base, s):
+    """Decoder capacity x s: ConvNeXt hidden width only (one block, as in every config)."""
+    return dict(base, conv_hidden=int(round(base["conv_hidden"] * s)))
+
+
+for _base_name in ("xxs4", "xs2"):
+    for _l in (0.5, 1, 2):
+        for _d in (0.5, 1, 2):
+            REFERENCES[f"{_base_name}-L{_l:g}-D{_d:g}"] = _scale_decoder(_scale_latent(REFERENCES[_base_name], _l), _d)
+
+# Temporal operator capacity (Experiment C): FiLM conv operator hidden width; "steps2" uses the
+# implementation's operator_steps=2, i.e. a +-2-frame window with a second forward/backward operator
+# pair whose residuals are summed with the first pair's (parallel, not sequential refinement).
+REFERENCES["xxs4-op24"] = dict(REFERENCES["xxs4"], op_hdim=24)
+REFERENCES["xxs4-op96"] = dict(REFERENCES["xxs4"], op_hdim=96)
+REFERENCES["xxs4-steps2"] = dict(REFERENCES["xxs4"], operator_steps=2)
+
+# Homogeneous-composition controls (Experiment D), Bunny only (absolute grid channels).
+# dupreal: the spectral head (complex Tucker x complex grid -> irfft2) is replaced by its real-domain
+#   mirror, an independently parameterized real Tucker x real grid head with no FFT. Same head count
+#   (latent output 3C channels), same grid footprint (4 x 180 x 320 vs 8 x 180 x 161), Tucker rank set
+#   so the head's parameters match the spectral head's (~362k per segment).
+REFERENCES["xxs4-dupreal"] = dict(REFERENCES["xxs4"], complex_tucker_ranks=False, complex_grid_ranks=False,
+                                  realprod_tucker_ranks=[2, 38, 38, 38], realprod_grid_ranks=4)
+# dupspec: the two real heads (real Tucker, real grid) are replaced by their spectral mirrors, a
+#   complex-Tucker-only head and a complex-grid-only head (each through irfft2), next to the standard
+#   spectral head. complex_grid_ranks is pinned to the standard Bunny value (4) because it would
+#   otherwise inherit grid_ranks=False.
+REFERENCES["xxs4-dupspec"] = dict(REFERENCES["xxs4"], real_tucker_ranks=False, grid_ranks=False, complex_grid_ranks=4,
+                                  spec_tucker_ranks=[2, 32, 32, 32], spec_grid_ranks=4)
